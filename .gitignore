@@ -1,0 +1,10 @@
+# created by setup.sh (nested upstream clones; the package ships only patches/)
+third_party/
+# default RESULTS_ROOT / MODEL_ROOT of run/common.sh
+results/
+models/
+# built by run/data_fetch.sh and run/data_prepare.sh (the frozen jsonl files under data/ are shipped)
+data/raw/
+data/lcb/*.parquet
+__pycache__/
+*.pyc

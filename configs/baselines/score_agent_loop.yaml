@@ -1,0 +1,2 @@
+- name: score_agent
+  _target_: leaf.baselines.score_agent.ScoreAgentLoop

@@ -1,0 +1,81 @@
+diff --git a/lcb_runner/evaluation/compute_code_generation_metrics.py b/lcb_runner/evaluation/compute_code_generation_metrics.py
+index b8de33e..b9b6e78 100644
+--- a/lcb_runner/evaluation/compute_code_generation_metrics.py
++++ b/lcb_runner/evaluation/compute_code_generation_metrics.py
+@@ -20,10 +20,13 @@ from lcb_runner.evaluation.testing_util import run_test
+ from lcb_runner.evaluation.pass_k_utils import compute_metrics_from_results
+ 
+ 
+-def _temp_run(sample, generation, debug, result, metadata_list, timeout):
+-    res, metadata = run_test(sample, test=generation, debug=debug, timeout=timeout)
+-    result.append(res)
+-    metadata_list.append(metadata)
++def _temp_run(sample, generation, debug, result_connection, timeout):
++    """Run one candidate and publish its result without a Manager process."""
++    try:
++        res, metadata = run_test(sample, test=generation, debug=debug, timeout=timeout)
++        result_connection.send((res, metadata))
++    finally:
++        result_connection.close()
+ 
+ 
+ def check_correctness(sample, generation, timeout, debug=True):
+@@ -31,26 +34,46 @@ def check_correctness(sample, generation, timeout, debug=True):
+     The global timeout is to catch some extreme/rare cases not handled by the timeouts
+     inside `run_test`"""
+ 
+-    manager = multiprocessing.Manager()
+-    result = manager.list()
+-    metadata_list = manager.list()
++    result_connection, child_connection = multiprocessing.Pipe(duplex=False)
+     p = multiprocessing.Process(
+         target=_temp_run,
+-        args=(sample, generation, debug, result, metadata_list, timeout),
++        args=(sample, generation, debug, child_connection, timeout),
+     )
+     p.start()
+-    p.join(
+-        timeout=(timeout + 1) * len(json.loads(sample["input_output"])["inputs"]) + 5
++    child_connection.close()
++    global_timeout = (
++        (timeout + 1) * len(json.loads(sample["input_output"])["inputs"]) + 5
+     )
+-    if p.is_alive():
+-        p.kill()
+-    if not result:
++    payload = None
++    try:
++        # Receive while the child is alive.  Joining before recv can deadlock if
++        # a large per-test result fills the OS pipe buffer.
++        if result_connection.poll(global_timeout):
++            try:
++                payload = result_connection.recv()
++            except EOFError:
++                payload = None
++    finally:
++        if p.is_alive():
++            p.kill()
++        p.join()
++        p.close()
++        result_connection.close()
++    if payload is None:
+         in_outs = json.loads(sample["input_output"])
+-        # consider that all tests failed
+-        result = [[-1 for i in range(len(in_outs["inputs"]))]]
++        # The worker may time out or terminate before it can publish either
++        # result. Treat that as a candidate timeout instead of reporting a
++        # TestRunnerError.
++        result = [-1 for i in range(len(in_outs["inputs"]))]
++        metadata = {
++            "error": "worker exited without returning a result",
++            "error_code": -1,
++            "error_message": "Timeout",
++        }
+         if debug:
+             print(f"global timeout")
+-    return result[0], metadata_list[0]
++        return result, metadata
++    return payload
+ 
+ 
+ def evaluate_generations_by_problem(args):

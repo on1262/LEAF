@@ -1,0 +1,272 @@
+{
+  "revision": "general_seed_baseline_qwen3_8b_seed1",
+  "data_root": "${RESULTS_ROOT}/general/seed1/seed_baseline/qwen3_8b",
+  "output_root": "${RESULTS_ROOT}/general/seed1/seed_baseline/qwen3_8b",
+  "raw_root": "${DATA_ROOT}/raw",
+  "dataset_size": 1378,
+  "source_sizes": {
+    "lcb": 478,
+    "math500": 500,
+    "sciknoweval": 400
+  },
+  "sources": {
+    "lcb": "${DATA_ROOT}/raw/code_generation_lite",
+    "math500": "${DATA_ROOT}/raw/hendrycks_math",
+    "sciknoweval": "${DATA_ROOT}/raw/SciKnowEval/data/v2/sciknoweval_test_v2.jsonl"
+  },
+  "models": {
+    "qwen3_8b": "${MODEL_ROOT}/Qwen3-8B"
+  },
+  "mix_seed": 140041,
+  "sciknoweval_sample_seed": 140042,
+  "decode_seed": 140044,
+  "schedule_seed": 140043,
+  "formal_steps": 15,
+  "smoke_steps": 2,
+  "smoke_dataset_size": 96,
+  "trials_per_problem": 15,
+  "training_temperature": 1.0,
+  "training_top_p": 1.0,
+  "response_max_tokens": 8192,
+  "max_model_len": 32768,
+  "max_num_seqs": 128,
+  "max_num_batched_tokens": 16384,
+  "gpu_memory_utilization": 0.9,
+  "compression_max_tokens": 1000,
+  "verifier_workers": 24,
+  "rollout_verifier_workers": 12,
+  "verifier_timeout": 6,
+  "mbpp_timeout": 30,
+  "verifier_candidate_memory_gib": 4,
+  "rollout_verifier_test_workers": 1,
+  "question_batch_size": 32,
+  "rollout_group_size": 8,
+  "score_rollout_group_size": 4,
+  "lora_rank": 64,
+  "lora_alpha": 64,
+  "lora_dropout": 0.0,
+  "lora_target_modules": "all-linear",
+  "learning_rate": 1e-05,
+  "weight_decay": 0.01,
+  "adam_beta1": 0.9,
+  "adam_beta2": 0.999,
+  "gradient_clip": 1.0,
+  "ppo_mini_batch_size": 32,
+  "ppo_micro_batch_size_per_gpu": 2,
+  "checkpoint_interval": 5,
+  "optimizer_checkpoint_interval": 25,
+  "ordinary_prompt_max_tokens": 4096,
+  "augmented_prompt_max_tokens": 10240,
+  "skill_max_tokens": 500,
+  "model_slugs": {
+    "qwen3_8b": "qwen3_8b"
+  },
+  "model_names": {
+    "qwen3_8b": "Qwen3-8B"
+  },
+  "smoke_updates": 2,
+  "aligned_steps_target": 15,
+  "adam_betas": [
+    0.9,
+    0.999
+  ],
+  "sdpo_execution_profiles": {
+    "a100": {
+      "actor_param_offload": false,
+      "vllm_gpu_memory_utilization": 0.5,
+      "vllm_max_num_seqs": 256,
+      "vllm_max_num_batched_tokens": 16384,
+      "ppo_micro_batch_size_per_gpu": 1,
+      "layered_summon": true
+    },
+    "h200": {
+      "actor_param_offload": false,
+      "vllm_gpu_memory_utilization": 0.45,
+      "vllm_max_num_seqs": 256,
+      "vllm_max_num_batched_tokens": 32768,
+      "ppo_micro_batch_size_per_gpu": 1,
+      "layered_summon": true
+    }
+  },
+  "distillation_topk": 20,
+  "sdpo_vocab_chunk_tokens": 2048,
+  "rollout_is_clip": 2.0,
+  "teacher_update_rate": 0.01,
+  "grpo_norm_adv_by_std_in_grpo": true,
+  "grpo_clip_ratio_high": 0.28,
+  "score_stage1_fraction": 0.25,
+  "score_beta1": 0.01,
+  "score_beta2": 0.25,
+  "score_correction_bonus": 10.0,
+  "score_per_turn_response_tokens": 8192,
+  "score_total_response_tokens": 16896,
+  "score_smoke_question_batch_size": 2,
+  "seed_sft_epochs": 3,
+  "seed_sft_batch_size": 8,
+  "seed_sft_micro_batch_size_per_gpu": 1,
+  "seed_smoke_question_batch_size": 2,
+  "seed_analyzer_temperature": 0.0,
+  "seed_analyzer_seed": 140045,
+  "seed_feedback_max_tokens": 2048,
+  "seed_gate_scale": 5.0,
+  "seed_opd_coefficient": 0.01,
+  "seed_reference_kl": 0.01,
+  "seed_ppo_clip": 0.2,
+  "random_sampling_chunk_size": 4096,
+  "random_sampling_max_num_seqs": 256,
+  "random_sampling_max_num_batched_tokens": 32768,
+  "random_sampling_gpu_memory_utilization": 0.9,
+  "seed_collection_fraction": 0.16,
+  "max_model_len_by_model": {
+    "qwen3_8b": 32768,
+    "olmo3_7b": 49152
+  },
+  "lcb_verifier_workers": 44,
+  "lcb_hf_snapshot": "${DATA_ROOT}/raw/code_generation_lite",
+  "kv_cache_tokens_measured": {
+    "qwen3_8b": 367792,
+    "olmo3_7b": 107040
+  },
+  "response_max_tokens_by_model": {
+    "qwen3_8b": 8192,
+    "olmo3_7b": 8192,
+    "llama3_1_8b": 8192
+  },
+  "variant_instruction_cells": {
+    "olmo3_7b": [
+      "lcb"
+    ]
+  },
+  "use_dynamic_bsz": true,
+  "response_max_tokens_overrides": {},
+  "use_remove_padding": true,
+  "ray_object_store_gib": 16,
+  "rollout_overrides": {
+    "qwen3_8b": {
+      "lcb": {
+        "by_condition": {
+          "seed_rl": {
+            "vllm_gpu_memory_utilization": 0.65,
+            "vllm_max_num_seqs": 256
+          }
+        }
+      },
+      "math500": {
+        "by_condition": {
+          "seed_rl": {
+            "vllm_gpu_memory_utilization": 0.65,
+            "vllm_max_num_seqs": 256
+          }
+        }
+      },
+      "sciknoweval": {
+        "by_condition": {
+          "seed_rl": {
+            "vllm_gpu_memory_utilization": 0.65,
+            "vllm_max_num_seqs": 256
+          }
+        }
+      }
+    }
+  },
+  "ppo_max_token_len_overrides": {
+    "olmo3_7b": {
+      "lcb": 40960
+    },
+    "qwen3_8b": {
+      "lcb": 32768,
+      "math500": 32768,
+      "sciknoweval": 32768
+    }
+  },
+  "max_num_seqs_by_model": {
+    "llama3_1_8b": {
+      "default": 256,
+      "math500": 80,
+      "sciknoweval": 80
+    },
+    "qwen3_8b": {
+      "default": 128,
+      "math500": 488,
+      "lcb": 136,
+      "mbpp": 384,
+      "sciknoweval": 400
+    }
+  },
+  "score_smoke_question_batch_size_by_model": {
+    "llama3_1_8b": 32
+  },
+  "seed_smoke_question_batch_size_by_model": {
+    "llama3_1_8b": 32
+  },
+  "smoke_source_sizes": {
+    "lcb": 32,
+    "math500": 32,
+    "sciknoweval": 32
+  },
+  "experiment": "general_seed_baseline",
+  "mbpp_private_tests": "mbppplus",
+  "mbpp_prompt_style": "chat",
+  "sciknoweval_open": true,
+  "sciknoweval_prompt_style": "chat",
+  "judge_max_tokens": 512,
+  "random_sampling_max_num_seqs_by_model": {
+    "qwen3_8b": {
+      "default": 512,
+      "lcb": 544,
+      "math500": 424,
+      "sciknoweval": 608
+    }
+  },
+  "lcb_ground_truth": "${DATA_ROOT}/lcb/lcb_ground_truth_full.parquet",
+  "generalization": {
+    "lcb_all_files": [
+      "test.jsonl",
+      "test2.jsonl",
+      "test3.jsonl",
+      "test4.jsonl",
+      "test5.jsonl",
+      "test6.jsonl"
+    ],
+    "lcb_train_files": [
+      "test2.jsonl",
+      "test3.jsonl",
+      "test4.jsonl",
+      "test5.jsonl"
+    ],
+    "math_train_level": "Level 5",
+    "sample_seed": 170042,
+    "mix_seed": 170041,
+    "test_samples": 4,
+    "test_seed": 170044,
+    "test_sets": {
+      "lcb": "${DATA_ROOT}/explore/qwen3_8b/dataset_lcb.jsonl",
+      "math500": "${DATA_ROOT}/explore/qwen3_8b/dataset_math500.jsonl",
+      "mbpp": "${DATA_ROOT}/explore/qwen3_8b/dataset_mbpp.jsonl",
+      "sciknoweval": "${DATA_ROOT}/explore/qwen3_8b/dataset_sciknoweval.jsonl"
+    },
+    "lcb_test_problems": "${DATA_ROOT}/lcb/lcb131_split.jsonl",
+    "lcb_test_ground_truth": "${DATA_ROOT}/lcb/test.parquet",
+    "test_max_num_seqs": {
+      "lcb": 512,
+      "math500": 928,
+      "mbpp": 1512,
+      "sciknoweval": 1376
+    },
+    "test_gpu_memory_utilization": 0.9,
+    "lcb_cpus_per_task": 48
+  },
+  "lcb_stop_at_first_failure": true,
+  "reward_loop_benchmarks": [
+    "lcb"
+  ],
+  "reward_loop_agent_workers": 4,
+  "seed_collection_overlap_chunk": {
+    "lcb": 256
+  },
+  "vllm_log_stats": true,
+  "leaf_carry_valid_code": [],
+  "leaf_total_tokens": {},
+  "leaf_lcb_grading_processes": 44,
+  "seed_sft_save_freq": 40
+}

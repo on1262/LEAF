@@ -1,0 +1,3045 @@
+diff --git a/verl/experimental/agent_loop/agent_loop.py b/verl/experimental/agent_loop/agent_loop.py
+index 157b1e2..e36940c 100644
+--- a/verl/experimental/agent_loop/agent_loop.py
++++ b/verl/experimental/agent_loop/agent_loop.py
+@@ -263,6 +263,12 @@ class AgentLoopBase(ABC):
+         Returns:
+             list[int]: Prompt token ids.
+         """
++        # An agent loop with no tools configured passes an empty list. Llama-3.1's
++        # chat template branches on `tools is not none`, so an empty list still
++        # renders the function-calling preamble -- "respond with a JSON for a
++        # function call", with no functions listed -- and the model answers every
++        # prompt with tool-call JSON instead of the task. Normalise empty to None.
++        tools = tools or None
+         if self.processor is not None:
+             raw_prompt = await self.loop.run_in_executor(
+                 None,
+@@ -470,9 +476,21 @@ class AgentLoopWorker:
+         for i in range(len(batch)):
+             trace_this_sample = i in traced_indices
+             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
++            sample_sampling_params = dict(sampling_params)
++            if "rollout_seed" in kwargs:
++                # DataProto.repeat(..., interleave=True) places a problem's n
++                # rollouts consecutively.  Use the frozen per-question base
++                # seed plus the within-group index, independent of UUID/request
++                # scheduling in the async server.
++                seed_stride = int(kwargs.get("rollout_seed_stride", 1))
++                sample_sampling_params["seed"] = (
++                    int(kwargs["rollout_seed"]) + (i % config.n) * seed_stride
++                )
+             tasks.append(
+                 asyncio.create_task(
+-                    self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
++                    self._run_agent_loop(
++                        sample_sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs
++                    )
+                 )
+             )
+         outputs = await asyncio.gather(*tasks)
+@@ -959,6 +977,44 @@ class AgentLoopManager:
+         output.meta_info = {"timing": timing, **outputs[0].meta_info}
+         return output
+ 
++    def generate_raw(
++        self,
++        prompt_ids: list[list[int]],
++        sampling_params: list[dict[str, Any]],
++        request_prefix: str = "raw",
++        use_lora: bool = True,
++    ) -> list[TokenOutput]:
++        """Generate an auxiliary token batch with the live rollout snapshot.
++
++        This deliberately bypasses the fixed-size AgentLoopOutput collation used
++        by training trajectories.  Auxiliary prompts (for example, SEED
++        hindsight analysis prompts) can therefore use their own context and
++        completion limits while still sharing the actor/vLLM parameters.
++        ``use_lora=False`` serves them from the base weights instead (the
++        LLM judge).
++        """
++        if len(prompt_ids) != len(sampling_params):
++            raise ValueError("prompt_ids and sampling_params must have equal lengths")
++        if not prompt_ids:
++            return []
++
++        self.wake_up()
++        try:
++            refs = []
++            for index, (ids, params) in enumerate(zip(prompt_ids, sampling_params, strict=True)):
++                server = self.server_handles[index % len(self.server_handles)]
++                refs.append(
++                    server.generate.remote(
++                        request_id=f"{request_prefix}:{index}:{uuid4().hex}",
++                        prompt_ids=ids,
++                        sampling_params=params,
++                        use_lora=use_lora,
++                    )
++                )
++            return ray.get(refs)
++        finally:
++            self.sleep()
++
+     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
+         timing = {}
+         t_generate_sequences = np.array([metric["generate_sequences"] for chunk in metrics for metric in chunk])
+diff --git a/verl/trainer/config/_generated_ppo_megatron_trainer.yaml b/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
+index ba37c7d..20fa9a2 100644
+--- a/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
+@@ -228,7 +228,7 @@ actor_rollout_ref:
+     log_prob_micro_batch_size_per_gpu: null
+     log_prob_use_dynamic_bsz: ${oc.select:actor_rollout_ref.actor.use_dynamic_bsz,false}
+     log_prob_max_token_len_per_gpu: ${oc.select:actor_rollout_ref.actor.ppo_max_token_len_per_gpu,16384}
+-    disable_log_stats: true
++    disable_log_stats: false
+     do_sample: true
+     'n': 1
+     over_sample_rate: 0
+@@ -604,7 +604,7 @@ reward_model:
+     limit_images: null
+     enable_chunked_prefill: true
+     enable_prefix_caching: true
+-    disable_log_stats: true
++    disable_log_stats: false
+     skip_tokenizer_init: false
+     prompt_length: 2048
+     response_length: 2048
+diff --git a/verl/trainer/config/_generated_ppo_trainer.yaml b/verl/trainer/config/_generated_ppo_trainer.yaml
+index 709228d..d25859d 100644
+--- a/verl/trainer/config/_generated_ppo_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_trainer.yaml
+@@ -219,7 +219,7 @@ actor_rollout_ref:
+     log_prob_micro_batch_size_per_gpu: null
+     log_prob_use_dynamic_bsz: ${oc.select:actor_rollout_ref.actor.use_dynamic_bsz,false}
+     log_prob_max_token_len_per_gpu: ${oc.select:actor_rollout_ref.actor.ppo_max_token_len_per_gpu,16384}
+-    disable_log_stats: true
++    disable_log_stats: false
+     do_sample: true
+     'n': 1
+     over_sample_rate: 0
+@@ -536,7 +536,7 @@ reward_model:
+     limit_images: null
+     enable_chunked_prefill: true
+     enable_prefix_caching: true
+-    disable_log_stats: true
++    disable_log_stats: false
+     skip_tokenizer_init: false
+     prompt_length: 2048
+     response_length: 2048
+diff --git a/verl/trainer/config/actor/actor.yaml b/verl/trainer/config/actor/actor.yaml
+index a717e9f..6f2b03f 100644
+--- a/verl/trainer/config/actor/actor.yaml
++++ b/verl/trainer/config/actor/actor.yaml
+@@ -89,6 +89,9 @@ self_distillation:
+   # Top-k for logit distillation; null uses full logits
+   distillation_topk: 100
+ 
++  # Token chunk size for vocabulary-wide top-k and normalization
++  vocab_chunk_size: 2048
++
+   # Whether to add a tail bucket when using distillation_topk
+   distillation_add_tail: True
+ 
+@@ -147,6 +150,17 @@ self_distillation:
+ 
+     {feedback_raw}
+ 
++# Optional per-turn KL schedule used by the SCoRe adaptation.
++score:
++  enabled: False
++  beta1: 0.01
++  beta2: 0.25
++
++# Confidence-gated OPD settings for the SEED adaptation.
++seed:
++  gate_scale: 5.0
++  opd_coefficient: 0.01
++
+ # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
+ clip_ratio_c: 3.0
+ 
+@@ -205,6 +219,9 @@ checkpoint:
+   # Whether to save checkpoints asynchronously. Only effective for Megatron as of now.
+   async_save: False
+ 
++  # Save optimizer state every this many global steps.
++  optimizer_save_freq: 1
++
+ # optimizer configs
+ optim:
+ 
+diff --git a/verl/trainer/config/config.py b/verl/trainer/config/config.py
+index bd323d0..b4de1c8 100644
+--- a/verl/trainer/config/config.py
++++ b/verl/trainer/config/config.py
+@@ -31,11 +31,13 @@ class CheckpointConfig(BaseConfig):
+             Options: 'model', 'optimizer', 'extra', 'hf_model'.
+         load_contents (list[str]): Contents to load from checkpoint. Defaults to same as save_contents.
+         async_save (bool): Whether to save checkpoints asynchronously. Only implemented for Megatron as of now.
++        optimizer_save_freq (int): Save optimizer state every this many global steps.
+     """
+ 
+     save_contents: list[str] = field(default_factory=lambda: ["model", "optimizer", "extra"])
+     load_contents: list[str] = field(default_factory=lambda: ["model", "optimizer", "extra"])
+     async_save: bool = False
++    optimizer_save_freq: int = 1
+ 
+ 
+ @dataclass
+diff --git a/verl/trainer/config/generation.yaml b/verl/trainer/config/generation.yaml
+index 4787333..4918534 100644
+--- a/verl/trainer/config/generation.yaml
++++ b/verl/trainer/config/generation.yaml
+@@ -42,7 +42,7 @@ rollout:
+   log_prob_micro_batch_size_per_gpu: 8
+   # for hf rollout
+   do_sample: True
+-  disable_log_stats: True
++  disable_log_stats: False
+   enable_chunked_prefill: True
+   n: 1
+   # support logging rollout prob for debugging purpose
+diff --git a/verl/trainer/config/model/hf_model.yaml b/verl/trainer/config/model/hf_model.yaml
+index be9ade8..aa3eab5 100644
+--- a/verl/trainer/config/model/hf_model.yaml
++++ b/verl/trainer/config/model/hf_model.yaml
+@@ -45,6 +45,9 @@ lora_rank: 0
+ # LoRA scaling factor
+ lora_alpha: 16
+ 
++# LoRA dropout probability
++lora_dropout: 0.0
++
+ # Target modules for LoRA adaptation
+ target_modules: all-linear
+ 
+diff --git a/verl/trainer/config/reward_model/dp_reward_loop.yaml b/verl/trainer/config/reward_model/dp_reward_loop.yaml
+index 04fb106..1077fc0 100644
+--- a/verl/trainer/config/reward_model/dp_reward_loop.yaml
++++ b/verl/trainer/config/reward_model/dp_reward_loop.yaml
+@@ -36,7 +36,7 @@ rollout:
+   limit_images: null
+   enable_chunked_prefill: true
+   enable_prefix_caching: true
+-  disable_log_stats: true
++  disable_log_stats: False
+   skip_tokenizer_init: false
+ 
+   prompt_length: 2048
+diff --git a/verl/trainer/config/reward_model/megatron_reward_loop.yaml b/verl/trainer/config/reward_model/megatron_reward_loop.yaml
+index f99b94a..6959a92 100644
+--- a/verl/trainer/config/reward_model/megatron_reward_loop.yaml
++++ b/verl/trainer/config/reward_model/megatron_reward_loop.yaml
+@@ -36,7 +36,7 @@ rollout:
+   limit_images: null
+   enable_chunked_prefill: true
+   enable_prefix_caching: true
+-  disable_log_stats: true
++  disable_log_stats: False
+   skip_tokenizer_init: false
+ 
+   prompt_length: 2048
+diff --git a/verl/trainer/config/rollout/rollout.yaml b/verl/trainer/config/rollout/rollout.yaml
+index bca721e..50253df 100644
+--- a/verl/trainer/config/rollout/rollout.yaml
++++ b/verl/trainer/config/rollout/rollout.yaml
+@@ -98,7 +98,7 @@ log_prob_use_dynamic_bsz: ${oc.select:actor_rollout_ref.actor.use_dynamic_bsz,fa
+ log_prob_max_token_len_per_gpu: ${oc.select:actor_rollout_ref.actor.ppo_max_token_len_per_gpu,16384}
+ 
+ # disable logging statistics
+-disable_log_stats: True
++disable_log_stats: False
+ 
+ # for hf rollout
+ # Whether to sample during training rollout. False uses greedy sampling.
+diff --git a/verl/trainer/config/sft_trainer.yaml b/verl/trainer/config/sft_trainer.yaml
+index b2308e3..ad388e6 100644
+--- a/verl/trainer/config/sft_trainer.yaml
++++ b/verl/trainer/config/sft_trainer.yaml
+@@ -24,6 +24,7 @@ data:
+   max_length: 1024
+   truncation: error
+   balance_dp_token: False
++  drop_last: True
+   chat_template: null
+   custom_cls:
+     path: null
+@@ -44,6 +45,7 @@ model:
+   trust_remote_code: False
+   lora_rank: 0  # Set to positive value to enable LoRA (e.g., 32)
+   lora_alpha: 16  # LoRA scaling factor
++  lora_dropout: 0.0
+   target_modules: all-linear  # Target modules for LoRA adaptation
+   use_liger: False
+   strategy: fsdp2
+diff --git a/verl/trainer/fsdp_sft_trainer.py b/verl/trainer/fsdp_sft_trainer.py
+index 17d157a..bdc78b7 100644
+--- a/verl/trainer/fsdp_sft_trainer.py
++++ b/verl/trainer/fsdp_sft_trainer.py
+@@ -23,16 +23,20 @@ import os
+ os.environ["NCCL_DEBUG"] = "WARN"
+ os.environ["TOKENIZERS_PARALLELISM"] = "true"
+ 
++import glob
++import json
+ import logging
+ import re
+ import time
+ from contextlib import nullcontext
++from dataclasses import asdict
+ 
+ import hydra
+ import torch
+ import torch.distributed
+ from omegaconf import DictConfig, OmegaConf
+ from peft import LoraConfig, TaskType, get_peft_model
++from safetensors.torch import save_file
+ from tensordict import TensorDict
+ from torch import nn
+ from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+@@ -48,7 +52,6 @@ from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, u
+ from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, get_checkpoint_tracker_filename
+ from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
+ from verl.utils.dataset import SFTDataset
+-from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
+ from verl.utils.device import (
+     auto_set_device,
+     get_device_id,
+@@ -67,12 +70,18 @@ from verl.utils.fsdp_utils import (
+     get_fsdp_wrap_policy,
+     get_init_weight_context_manager,
+     init_fn,
++    layered_summon_lora_params,
+ )
+ from verl.utils.logger import log_with_rank
++from verl.utils.peft_compat import ensure_peft_transformers_compatibility
+ from verl.utils.profiler import log_gpu_memory_usage
+ from verl.utils.py_functional import convert_to_regular_types
+ from verl.utils.torch_dtypes import PrecisionType
+-from verl.utils.torch_functional import get_cosine_schedule_with_warmup, get_wsd_schedule_with_warmup
++from verl.utils.torch_functional import (
++    get_constant_schedule_with_warmup,
++    get_cosine_schedule_with_warmup,
++    get_wsd_schedule_with_warmup,
++)
+ from verl.utils.tracking import Tracking
+ from verl.utils.ulysses import (
+     gather_outputs_and_unpad,
+@@ -179,7 +188,11 @@ class FSDPSFTTrainer:
+         device_name = get_device_name()
+ 
+         self.train_sampler = DistributedSampler(
+-            self.train_dataset, shuffle=True, num_replicas=world_size, rank=rank, drop_last=True
++            self.train_dataset,
++            shuffle=True,
++            num_replicas=world_size,
++            rank=rank,
++            drop_last=config.data.drop_last,
+         )
+         self.train_dataloader = StatefulDataLoader(
+             dataset=self.train_dataset,
+@@ -187,12 +200,16 @@ class FSDPSFTTrainer:
+             sampler=self.train_sampler,
+             num_workers=8,
+             pin_memory=True,
+-            drop_last=True,
++            drop_last=config.data.drop_last,
+             pin_memory_device=device_name,
+         )
+ 
+         self.val_sampler = DistributedSampler(
+-            self.val_dataset, shuffle=False, num_replicas=world_size, rank=rank, drop_last=True
++            self.val_dataset,
++            shuffle=False,
++            num_replicas=world_size,
++            rank=rank,
++            drop_last=config.data.drop_last,
+         )
+         self.val_dataloader = StatefulDataLoader(
+             dataset=self.val_dataset,
+@@ -200,7 +217,7 @@ class FSDPSFTTrainer:
+             sampler=self.val_sampler,
+             num_workers=8,
+             pin_memory=True,
+-            drop_last=True,
++            drop_last=config.data.drop_last,
+             pin_memory_device=device_name,
+         )
+ 
+@@ -261,6 +278,7 @@ class FSDPSFTTrainer:
+ 
+                 lora_adapter_path = self.config.model.get("lora_adapter_path")
+                 if lora_adapter_path is not None:
++                    ensure_peft_transformers_compatibility()
+                     from peft import PeftModel
+ 
+                     print(f"Loading pre-trained LoRA adapter for sft from: {lora_adapter_path}")
+@@ -278,6 +296,7 @@ class FSDPSFTTrainer:
+                         "task_type": TaskType.CAUSAL_LM,
+                         "r": self.config.model.lora_rank,
+                         "lora_alpha": self.config.model.lora_alpha,
++                        "lora_dropout": self.config.model.lora_dropout,
+                         "target_modules": convert_to_regular_types(self.config.model.target_modules),
+                         "bias": "none",
+                     }
+@@ -362,6 +381,10 @@ class FSDPSFTTrainer:
+             self.lr_scheduler = get_cosine_schedule_with_warmup(
+                 optimizer=self.optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=self.total_steps
+             )
++        elif self.config.optim.lr_scheduler == "constant":
++            self.lr_scheduler = get_constant_schedule_with_warmup(
++                optimizer=self.optimizer, num_warmup_steps=num_warmup_steps
++            )
+         elif self.config.optim.lr_scheduler == "wsd":
+             self.lr_scheduler = get_wsd_schedule_with_warmup(
+                 optimizer=self.optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=self.total_steps
+@@ -554,11 +577,49 @@ class FSDPSFTTrainer:
+         # Get max checkpoints to keep
+         max_ckpt_to_keep = getattr(self.config.trainer, "max_ckpt_to_keep", None)
+ 
+-        # Use checkpoint manager to save
++        # A LoRA SFT checkpoint is resumable only with its optimizer and extra
++        # state beside the adapter, so all three are written at every save;
++        # older global_step_* directories are pruned once the tracker points at
++        # this one (verl.utils.checkpoint.lora_resume).
++        checkpoint_config = getattr(self.config.trainer, "checkpoint", {})
++        optimizer_save_freq = int(checkpoint_config.get("optimizer_save_freq", 1))
++        if self.lora:
++            if optimizer_save_freq != 1:
++                raise ValueError(
++                    f"optimizer_save_freq={optimizer_save_freq}: LoRA checkpoints must save the optimizer every time"
++                )
++            missing = {"optimizer", "extra"} - set(self.checkpoint_manager.checkpoint_save_contents)
++            if missing:
++                raise ValueError(f"LoRA checkpoint save_contents lacks {sorted(missing)}")
+         self.checkpoint_manager.save_checkpoint(
+-            local_path=local_global_step_folder, global_step=step, max_ckpt_to_keep=max_ckpt_to_keep
++            local_path=local_global_step_folder,
++            global_step=step,
++            max_ckpt_to_keep=max_ckpt_to_keep,
+         )
+ 
++        # The generic FSDP checkpoint is sufficient for resuming this trainer,
++        # but the following RL stage needs a standard PEFT adapter directory.
++        # Export it alongside every SFT checkpoint without materializing the
++        # frozen base model.
++        if self.lora:
++            peft_model = getattr(self.fsdp_model, "_fsdp_wrapped_module", self.fsdp_model)
++            adapter_path = os.path.join(local_global_step_folder, "lora_adapter")
++            peft_config = None
++            if self.device_mesh.get_rank() == 0:
++                os.makedirs(adapter_path, exist_ok=True)
++                peft_config = asdict(peft_model.peft_config.get("default", {}))
++                peft_config["task_type"] = peft_config["task_type"].value
++                peft_config["peft_type"] = peft_config["peft_type"].value
++                peft_config["target_modules"] = list(peft_config["target_modules"])
++            lora_params = layered_summon_lora_params(self.fsdp_model)
++            if self.device_mesh.get_rank() == 0:
++                save_file(lora_params, os.path.join(adapter_path, "adapter_model.safetensors"))
++                with open(os.path.join(adapter_path, "adapter_config.json"), "w", encoding="utf-8") as handle:
++                    json.dump(peft_config, handle, ensure_ascii=False, indent=2)
++            torch.distributed.barrier()
++
++        torch.distributed.barrier()
++
+         # Save dataloader state
+         if self.device_mesh.get_rank() == 0:
+             local_mkdir_safe(local_global_step_folder)
+@@ -576,6 +637,12 @@ class FSDPSFTTrainer:
+                 f.write(str(step))
+             os.rename(temp_tracker_file, tracker_file)
+             print(f"Updated checkpoint tracker: {tracker_file}")
++            if getattr(self.config.trainer, "keep_only_latest_checkpoint", True):
++                from verl.utils.checkpoint.lora_resume import prune_checkpoints
++
++                removed = prune_checkpoints(self.config.trainer.default_local_dir, step)
++                if removed:
++                    print(f"Pruned {len(removed)} older checkpoint(s)")
+ 
+         # Copy to HDFS if configured
+         if self.device_mesh.get_rank() == 0 and getattr(self.config.trainer, "default_hdfs_dir", None):
+@@ -631,8 +698,20 @@ class FSDPSFTTrainer:
+             return 0
+         self.resume_global_step = resume_step
+ 
++        from verl.utils.checkpoint import lora_resume
++
++        # Hard checks: a LoRA resume must restore adapter, optimizer and extra.
++        lora_resume.assert_resume_contents(self.checkpoint_manager, checkpoint_path, self.lora)
++        if not os.path.exists(os.path.join(checkpoint_path, "data.pt")):
++            raise lora_resume.ResumeError(f"SFT resume: {checkpoint_path}/data.pt is missing")
++
+         # Use checkpoint manager to load model state
+         self.checkpoint_manager.load_checkpoint(checkpoint_path)
++        if self.lora:
++            # The adapter is saved beside the (unsaved) sharded model state and
++            # has to be loaded back explicitly, then checked tensor by tensor.
++            lora_resume.restore_adapter(self.fsdp_model, checkpoint_path, lora_resume.ADAPTER_DIR, "sft")
++            torch.distributed.barrier()
+         log_with_rank(
+             f"Successfully loaded model checkpoint from {checkpoint_path} (step {resume_step})",
+             logger=logger,
+@@ -767,7 +846,8 @@ class FSDPSFTTrainer:
+                 )
+             ):
+                 global_step += 1
+-                data = TensorDict(data, batch_size=self.config.data.train_batch_size).to(self.device_name)
++                actual_batch_size = next(iter(data.values())).shape[0]
++                data = TensorDict(data, batch_size=actual_batch_size).to(self.device_name)
+                 metric = self.training_step(data)
+                 train_time += metric["train/time(s)"]
+                 if rank == 0:
+@@ -859,6 +939,8 @@ def create_sft_dataset(data_paths, data_config, tokenizer, max_samples=-1):
+         dataset_cls = load_extern_object(data_config.custom_cls.path, data_config.custom_cls.name)
+     # Then check if multi-turn dataset should be used
+     elif data_config.get("multiturn", {}).get("enable", False):
++        from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
++
+         dataset_cls = MultiTurnSFTDataset
+     # Default to single-turn dataset
+     else:
+diff --git a/verl/trainer/main_ppo.py b/verl/trainer/main_ppo.py
+index b88deba..4f84d09 100644
+--- a/verl/trainer/main_ppo.py
++++ b/verl/trainer/main_ppo.py
+@@ -32,6 +32,14 @@ from verl.utils.device import auto_set_device, is_cuda_available
+ from verl.utils.import_utils import load_extern_object
+ 
+ 
++def reference_policy_is_actor_base(config) -> bool:
++    """Whether KL reference logits come from the actor with LoRA disabled."""
++    lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
++    if lora_rank <= 0:
++        lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
++    return lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
++
++
+ @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
+ def main(config):
+     """Main entry point for PPO training with Hydra configuration management.
+@@ -128,9 +136,19 @@ class TaskRunner:
+         use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+         self_distillation_cfg = config.actor_rollout_ref.actor.get("self_distillation", None)
+         loss_mode = config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
+-        self_distillation_needs_ref = self_distillation_cfg is not None and loss_mode == "sdpo"
+-        if self_distillation_needs_ref and need_reference_policy(config):
+-            raise ValueError("SDPO cannot share the reference policy with KL regularization.")
++        self_distillation_needs_ref = (
++            self_distillation_cfg is not None and loss_mode in {"sdpo", "seed"}
++        )
++        # SDPO reserves the colocated reference module for the teacher.  SEED
++        # additionally uses a base-model KL term; with LoRA this is unambiguous:
++        # its teacher remains the separate EMA module, while KL log-probabilities
++        # come from the actor with its adapter disabled.
++        if self_distillation_needs_ref and need_reference_policy(config) and not (
++            loss_mode == "seed" and reference_policy_is_actor_base(config)
++        ):
++            raise ValueError(
++                "Self-distillation can use KL regularization only for SEED with a LoRA actor-base reference."
++            )
+         if self_distillation_needs_ref and use_legacy_worker_impl == "disable":
+             raise ValueError(
+                 "SDPO requires the legacy worker implementation to colocate the teacher."
+@@ -143,10 +161,7 @@ class TaskRunner:
+             actor_rollout_cls = ActorRolloutRefWorker
+             ray_worker_group_cls = RayWorkerGroup
+ 
+-            lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
+-            if lora_rank <= 0:
+-                lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
+-            ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
++            ref_in_actor = reference_policy_is_actor_base(config)
+             # NOTE: In new model engine, ref policy and actor rollout are in same ActorRolloutRefWorker,
+             # while in legacy model engine, ref policy is in a separate ActorRolloutRefWorker.
+             if need_reference_policy(config) and not ref_in_actor:
+@@ -264,7 +279,9 @@ class TaskRunner:
+         if use_legacy_worker_impl == "disable":
+             return
+ 
+-        if need_reference_policy(config):
++        # A LoRA actor already provides the frozen base reference by disabling
++        # its adapter.  Do not spawn a dormant standalone reference worker.
++        if need_reference_policy(config) and not reference_policy_is_actor_base(config):
+             self.role_worker_mapping[Role.RefPolicy] = ray.remote(ref_policy_cls)
+             self.mapping[Role.RefPolicy] = "global_pool"
+ 
+@@ -355,8 +372,16 @@ class TaskRunner:
+         )
+         train_sampler = create_rl_sampler(config.data, train_dataset)
+ 
+-        # Initialize the PPO trainer.
+-        trainer = RayPPOTrainer(
++        # Initialize the PPO trainer. A project runner may substitute its own
++        # RayPPOTrainer subclass (e.g. one that drives a multi-turn rollout from
++        # a custom fit loop) through trainer.trainer_class.
++        trainer_cls = RayPPOTrainer
++        trainer_fqn = config.trainer.get("trainer_class", None)
++        if trainer_fqn:
++            from verl.utils.import_utils import load_class_from_fqn
++
++            trainer_cls = load_class_from_fqn(trainer_fqn, "RayPPOTrainer subclass")
++        trainer = trainer_cls(
+             config=config,
+             tokenizer=tokenizer,
+             processor=processor,
+diff --git a/verl/trainer/ppo/core_algos.py b/verl/trainer/ppo/core_algos.py
+index 25509cd..29c86d8 100644
+--- a/verl/trainer/ppo/core_algos.py
++++ b/verl/trainer/ppo/core_algos.py
+@@ -20,6 +20,7 @@ implement PPO-like algorithms.
+ 
+ __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
+ 
++import math
+ from collections import defaultdict
+ from enum import Enum
+ from typing import Any, Callable, Optional
+@@ -1188,6 +1189,54 @@ def compute_self_distillation_loss(
+     return loss, metrics
+ 
+ 
++def compute_opd_loss(
++    log_prob: torch.Tensor,
++    teacher_log_prob: torch.Tensor,
++    response_mask: torch.Tensor,
++    opd_step_mask: Optional[torch.Tensor] = None,
++    gate_beta: float = 5.0,
++    loss_agg_mode: str = "token-mean",
++) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
++    """Confidence-gated OPD with detached teacher and gate (SEED)."""
++    if log_prob.shape != teacher_log_prob.shape or log_prob.shape != response_mask.shape:
++        raise ValueError("OPD log-probability and response-mask shapes must match")
++    if opd_step_mask is None:
++        opd_mask = response_mask
++    else:
++        opd_step_mask = opd_step_mask.to(device=log_prob.device, dtype=response_mask.dtype)
++        if opd_step_mask.ndim == 1:
++            if opd_step_mask.shape[0] != response_mask.shape[0]:
++                raise ValueError("OPD sample mask has the wrong batch size")
++            opd_mask = response_mask * opd_step_mask.unsqueeze(-1)
++        elif opd_step_mask.shape == response_mask.shape:
++            opd_mask = response_mask * opd_step_mask
++        else:
++            raise ValueError("OPD mask must be sample-level or token-level")
++    if not torch.any(opd_mask > 0):
++        zero = log_prob.sum() * 0.0
++        return zero, {
++            "seed/opd_active_token_ratio": zero.detach(),
++            "seed/opd_gate_mean": zero.detach(),
++            "seed/opd_gate_active_ratio": zero.detach(),
++            "seed/opd_teacher_gap_mean": zero.detach(),
++        }
++    teacher_log_prob = teacher_log_prob.detach()
++    teacher_gap = (teacher_log_prob - log_prob.detach()).detach()
++    gate = torch.sigmoid(float(gate_beta) * teacher_gap).detach()
++    loss = agg_loss(
++        loss_mat=gate * (teacher_log_prob - log_prob),
++        loss_mask=opd_mask,
++        loss_agg_mode=loss_agg_mode,
++        batch_num_tokens=opd_mask.sum().clamp(min=1.0),
++    )
++    return loss, {
++        "seed/opd_active_token_ratio": (opd_mask > 0).float().mean().detach(),
++        "seed/opd_gate_mean": verl_F.masked_mean(gate, opd_mask).detach(),
++        "seed/opd_gate_active_ratio": verl_F.masked_mean((gate > 0.5).float(), opd_mask).detach(),
++        "seed/opd_teacher_gap_mean": verl_F.masked_mean(teacher_gap, opd_mask).detach(),
++    }
++
++
+ @deprecated("verl.trainer.ppo.core_algos.compute_policy_loss_vanilla")
+ def compute_policy_loss(
+     old_log_prob,
+@@ -2306,3 +2355,323 @@ def compute_policy_loss_bypass_mode(
+     pg_metrics.update(rollout_metrics)
+ 
+     return pg_loss, pg_metrics
++
++
++class _ChunkedFullVocabKL(torch.autograd.Function):
++    """Per-row full-vocabulary KL between two logit matrices, in row chunks.
++
++    ``student_logits`` and ``teacher_logits`` are ``(n, V)`` rows already
++    divided by the sampling temperature. Only the student side receives a
++    gradient. Neither the fp32 log-softmax nor the probabilities are kept for
++    backward: each chunk is recomputed there, so the extra live memory is one
++    chunk of ``(chunk, V)`` fp32 temporaries rather than several ``(n, V)``
++    tensors.
++
++    ``reverse=True`` computes KL(student || teacher); ``reverse=False``
++    computes KL(teacher || student).
++    """
++
++    @staticmethod
++    def forward(ctx, student_logits, teacher_logits, reverse: bool, chunk_size: int):
++        rows = student_logits.shape[0]
++        out = torch.empty(rows, dtype=torch.float32, device=student_logits.device)
++        for start in range(0, rows, chunk_size):
++            stop = min(start + chunk_size, rows)
++            student = torch.log_softmax(student_logits[start:stop].float(), dim=-1)
++            teacher = torch.log_softmax(teacher_logits[start:stop].float(), dim=-1)
++            if reverse:
++                out[start:stop] = (student.exp() * (student - teacher)).sum(-1)
++            else:
++                out[start:stop] = (teacher.exp() * (teacher - student)).sum(-1)
++            del student, teacher
++        ctx.save_for_backward(student_logits, teacher_logits)
++        ctx.reverse = bool(reverse)
++        ctx.chunk_size = int(chunk_size)
++        return out
++
++    @staticmethod
++    def backward(ctx, grad_out):
++        student_logits, teacher_logits = ctx.saved_tensors
++        grad = torch.empty_like(student_logits)
++        rows = student_logits.shape[0]
++        for start in range(0, rows, ctx.chunk_size):
++            stop = min(start + ctx.chunk_size, rows)
++            student = torch.log_softmax(student_logits[start:stop].float(), dim=-1)
++            teacher = torch.log_softmax(teacher_logits[start:stop].float(), dim=-1)
++            probs = student.exp()
++            if ctx.reverse:
++                # d/dz_s sum_v p_s (log p_s - log p_t) = p_s * (log p_s - log p_t - KL)
++                diff = student - teacher
++                kl = (probs * diff).sum(-1, keepdim=True)
++                chunk_grad = probs * (diff - kl)
++                del diff, kl
++            else:
++                # d/dz_s sum_v p_t (log p_t - log p_s) = p_s - p_t
++                chunk_grad = probs - teacher.exp()
++            grad[start:stop] = (chunk_grad * grad_out[start:stop, None]).to(grad.dtype)
++            del student, teacher, probs, chunk_grad
++        return grad, None, None, None
++
++
++def chunked_full_vocab_kl(
++    student_logits: torch.Tensor,
++    teacher_logits: torch.Tensor,
++    reverse: bool,
++    chunk_size: int = 1024,
++) -> torch.Tensor:
++    """Row-wise full-vocabulary KL; see :class:`_ChunkedFullVocabKL`."""
++    if student_logits.shape != teacher_logits.shape:
++        raise ValueError(
++            f"student/teacher logits differ: {tuple(student_logits.shape)} vs "
++            f"{tuple(teacher_logits.shape)}"
++        )
++    return _ChunkedFullVocabKL.apply(
++        student_logits, teacher_logits.detach(), bool(reverse), int(chunk_size)
++    )
++
++
++# --------------------------------------------------------------------------- #
++# Project addition: high-clipped full-vocabulary KLs.
++#
++# Per-token values are summed over the full vocabulary of per-entry contributions
++# c_v; entries with c_v > tau are constantized (sum_v min(c_v, tau)). The
++# log-softmaxes are taken in fp32 chunk by chunk and recomputed in backward, as in
++# _ChunkedFullVocabKL. The clip boundary follows torch.clamp's gradient: kept
++# where c_v <= tau.
++# --------------------------------------------------------------------------- #
++
++
++class _ChunkedHighClipForwardKL(torch.autograd.Function):
++    """Student loss sum_v min(t_v log(t_v / s_v), tau); gradient into the student only.
++
++    Returns ``(loss, forward_kl, reverse_kl, positive_mass, clipped_positive_mass,
++    clipped_vocab)`` per row: the clipped loss (differentiable), the unclipped
++    KL(t || s), KL(s || t), sum of the positive contributions, the positive
++    mass the clip removes (sum of c_v - tau over c_v > tau), and the number of
++    vocabulary entries above tau.
++    """
++
++    @staticmethod
++    def forward(ctx, student_logits, teacher_logits, tau: float, chunk_size: int):
++        rows = student_logits.shape[0]
++        device = student_logits.device
++        outs = [torch.empty(rows, dtype=torch.float32, device=device) for _ in range(6)]
++        for start in range(0, rows, chunk_size):
++            stop = min(start + chunk_size, rows)
++            student = torch.log_softmax(student_logits[start:stop].float(), dim=-1)
++            teacher = torch.log_softmax(teacher_logits[start:stop].float(), dim=-1)
++            teacher_probs = teacher.exp()
++            contributions = teacher_probs * (teacher - student)
++            outs[0][start:stop] = contributions.clamp(max=tau).sum(-1)
++            outs[1][start:stop] = contributions.sum(-1)
++            outs[2][start:stop] = (student.exp() * (student - teacher)).sum(-1)
++            outs[3][start:stop] = contributions.clamp(min=0).sum(-1)
++            outs[4][start:stop] = (contributions - tau).clamp(min=0).sum(-1)
++            outs[5][start:stop] = (contributions > tau).sum(-1).float()
++            del student, teacher, teacher_probs, contributions
++        ctx.save_for_backward(student_logits, teacher_logits)
++        ctx.tau = float(tau)
++        ctx.chunk_size = int(chunk_size)
++        ctx.mark_non_differentiable(*outs[1:])
++        return tuple(outs)
++
++    @staticmethod
++    def backward(ctx, grad_out, *unused):
++        student_logits, teacher_logits = ctx.saved_tensors
++        grad = torch.empty_like(student_logits)
++        rows = student_logits.shape[0]
++        for start in range(0, rows, ctx.chunk_size):
++            stop = min(start + ctx.chunk_size, rows)
++            student = torch.log_softmax(student_logits[start:stop].float(), dim=-1)
++            teacher = torch.log_softmax(teacher_logits[start:stop].float(), dim=-1)
++            teacher_probs = teacher.exp()
++            kept = teacher_probs * ((teacher_probs * (teacher - student)) <= ctx.tau)
++            # d/dlog s_v of min(c_v, tau) = -t_v [c_v <= tau]; through log_softmax:
++            # grad_j = g_j - s_j sum_v g_v with g = -t * kept
++            chunk_grad = student.exp() * kept.sum(-1, keepdim=True) - kept
++            grad[start:stop] = (chunk_grad * grad_out[start:stop, None]).to(grad.dtype)
++            del student, teacher, teacher_probs, kept, chunk_grad
++        return grad, None, None, None
++
++
++def chunked_high_clip_forward_kl(
++    student_logits: torch.Tensor,
++    teacher_logits: torch.Tensor,
++    tau: float,
++    chunk_size: int = 1024,
++) -> dict[str, torch.Tensor]:
++    """Per-row forward KL(teacher || student) with the per-entry high clip; see
++    :class:`_ChunkedHighClipForwardKL`. Each chunk's log-softmax and clip mask are
++    computed in fp32."""
++    if student_logits.shape != teacher_logits.shape:
++        raise ValueError(
++            f"student/teacher logits differ: {tuple(student_logits.shape)} vs {tuple(teacher_logits.shape)}"
++        )
++    if tau <= 0:
++        raise ValueError("the KL contribution clip threshold must be positive")
++    names = ("loss", "forward_kl", "reverse_kl", "positive_mass", "clipped_positive_mass", "clipped_vocab")
++    outs = _ChunkedHighClipForwardKL.apply(
++        student_logits, teacher_logits.detach(), float(tau), int(chunk_size)
++    )
++    return dict(zip(names, outs, strict=True))
++
++
++class _ChunkedHighClipReverseKL(torch.autograd.Function):
++    """Student loss sum_v min(s_v log(s_v / t_v), tau); gradient into the student only.
++
++    The reverse-KL counterpart of :class:`_ChunkedHighClipForwardKL`: c_v =
++    s_v (log s_v - log t_v) is the per-vocabulary reverse-KL contribution; the
++    entries above tau are constantized. Returns ``(loss, forward_kl, reverse_kl,
++    positive_mass, clipped_positive_mass, clipped_vocab)`` per row with the same
++    meaning as the forward version (positive / clipped mass of c).
++    """
++
++    @staticmethod
++    def forward(ctx, student_logits, teacher_logits, tau: float, chunk_size: int):
++        rows = student_logits.shape[0]
++        device = student_logits.device
++        outs = [torch.empty(rows, dtype=torch.float32, device=device) for _ in range(6)]
++        for start in range(0, rows, chunk_size):
++            stop = min(start + chunk_size, rows)
++            student = torch.log_softmax(student_logits[start:stop].float(), dim=-1)
++            teacher = torch.log_softmax(teacher_logits[start:stop].float(), dim=-1)
++            contributions = student.exp() * (student - teacher)
++            outs[0][start:stop] = contributions.clamp(max=tau).sum(-1)
++            outs[1][start:stop] = (teacher.exp() * (teacher - student)).sum(-1)
++            outs[2][start:stop] = contributions.sum(-1)
++            outs[3][start:stop] = contributions.clamp(min=0).sum(-1)
++            outs[4][start:stop] = (contributions - tau).clamp(min=0).sum(-1)
++            outs[5][start:stop] = (contributions > tau).sum(-1).float()
++            del student, teacher, contributions
++        ctx.save_for_backward(student_logits, teacher_logits)
++        ctx.tau = float(tau)
++        ctx.chunk_size = int(chunk_size)
++        ctx.mark_non_differentiable(*outs[1:])
++        return tuple(outs)
++
++    @staticmethod
++    def backward(ctx, grad_out, *unused):
++        student_logits, teacher_logits = ctx.saved_tensors
++        grad = torch.empty_like(student_logits)
++        rows = student_logits.shape[0]
++        for start in range(0, rows, ctx.chunk_size):
++            stop = min(start + ctx.chunk_size, rows)
++            student = torch.log_softmax(student_logits[start:stop].float(), dim=-1)
++            teacher = torch.log_softmax(teacher_logits[start:stop].float(), dim=-1)
++            probs = student.exp()
++            log_ratio = student - teacher
++            kept = (probs * log_ratio) <= ctx.tau
++            # d c_v / d log s_v = s_v (log s_v - log t_v + 1); through log_softmax:
++            # grad_j = w_j - s_j sum_v w_v with w = kept * s * (log ratio + 1)
++            weight = probs * (log_ratio + 1.0) * kept
++            chunk_grad = weight - probs * weight.sum(-1, keepdim=True)
++            grad[start:stop] = (chunk_grad * grad_out[start:stop, None]).to(grad.dtype)
++            del student, teacher, probs, log_ratio, kept, weight, chunk_grad
++        return grad, None, None, None
++
++
++def chunked_high_clip_reverse_kl(student_logits, teacher_logits, tau: float, chunk_size: int = 1024):
++    """Per-row high-clipped reverse KL(student || teacher); see :class:`_ChunkedHighClipReverseKL`."""
++    if student_logits.shape != teacher_logits.shape:
++        raise ValueError(
++            f"student/teacher logits differ: {tuple(student_logits.shape)} vs {tuple(teacher_logits.shape)}"
++        )
++    if tau <= 0:
++        raise ValueError("the KL contribution clip threshold must be positive")
++    names = ("loss", "forward_kl", "reverse_kl", "positive_mass", "clipped_positive_mass", "clipped_vocab")
++    outs = _ChunkedHighClipReverseKL.apply(student_logits, teacher_logits.detach(), float(tau), int(chunk_size))
++    return dict(zip(names, outs, strict=True))
++
++
++# --------------------------------------------------------------------------- #
++# Project addition: Jensen-Shannon divergence, beta = 0.5.
++#
++# JSD(s, t) = 0.5 KL(s || m) + 0.5 KL(t || m), m = (s + t) / 2, summed over the
++# full vocabulary from per-entry terms d_v = 0.5 [s_v log(s_v / m_v) + t_v log(t_v / m_v)]
++# (each d_v >= 0). Optional high clip: sum_v min(d_v, tau), the clipped entries
++# constantized (kept where d_v <= tau, torch.clamp's gradient). The teacher is
++# stop-grad. Since m_v depends on s only through s_v, d d_v / d s_v = 0.5 log(s_v / m_v);
++# chunked / recomputed in backward as _ChunkedFullVocabKL.
++# --------------------------------------------------------------------------- #
++
++_LOG2 = math.log(2.0)
++
++
++class _ChunkedJSD(torch.autograd.Function):
++    """Per-row JSD_0.5(student, teacher), optionally high-clipped per vocabulary entry.
++
++    Returns ``(loss, jsd, forward_kl, reverse_kl, clipped_positive_mass, clipped_vocab)``
++    per row: the (clipped) loss (differentiable), the unclipped JSD, KL(t || s),
++    KL(s || t), sum of d_v - tau over d_v > tau, and the number of entries above tau
++    (both 0 without a clip).
++    """
++
++    @staticmethod
++    def forward(ctx, student_logits, teacher_logits, tau, chunk_size: int):
++        rows = student_logits.shape[0]
++        device = student_logits.device
++        outs = [torch.zeros(rows, dtype=torch.float32, device=device) for _ in range(6)]
++        for start in range(0, rows, chunk_size):
++            stop = min(start + chunk_size, rows)
++            student = torch.log_softmax(student_logits[start:stop].float(), dim=-1)
++            teacher = torch.log_softmax(teacher_logits[start:stop].float(), dim=-1)
++            mixture = torch.logaddexp(student, teacher).sub_(_LOG2)
++            student_probs, teacher_probs = student.exp(), teacher.exp()
++            terms = (student_probs * (student - mixture)).add_(teacher_probs * (teacher - mixture)).mul_(0.5)
++            del mixture
++            outs[1][start:stop] = terms.sum(-1)
++            if tau is None:
++                outs[0][start:stop] = outs[1][start:stop]
++            else:
++                outs[0][start:stop] = terms.clamp(max=tau).sum(-1)
++                outs[4][start:stop] = (terms - tau).clamp_(min=0).sum(-1)
++                outs[5][start:stop] = (terms > tau).sum(-1).float()
++            del terms
++            log_ratio = teacher - student
++            outs[2][start:stop] = (teacher_probs * log_ratio).sum(-1)
++            outs[3][start:stop] = -(student_probs * log_ratio).sum(-1)
++            del student, teacher, student_probs, teacher_probs, log_ratio
++        ctx.save_for_backward(student_logits, teacher_logits)
++        ctx.tau = None if tau is None else float(tau)
++        ctx.chunk_size = int(chunk_size)
++        ctx.mark_non_differentiable(*outs[1:])
++        return tuple(outs)
++
++    @staticmethod
++    def backward(ctx, grad_out, *unused):
++        student_logits, teacher_logits = ctx.saved_tensors
++        grad = torch.empty_like(student_logits)
++        rows = student_logits.shape[0]
++        for start in range(0, rows, ctx.chunk_size):
++            stop = min(start + ctx.chunk_size, rows)
++            student = torch.log_softmax(student_logits[start:stop].float(), dim=-1)
++            teacher = torch.log_softmax(teacher_logits[start:stop].float(), dim=-1)
++            mixture = torch.logaddexp(student, teacher).sub_(_LOG2)
++            probs = student.exp()
++            # w_v = d d_v / d log s_v = 0.5 s_v log(s_v / m_v) on the kept entries;
++            # through log_softmax: grad_j = w_j - s_j sum_v w_v
++            weight = probs * (student - mixture) * 0.5
++            if ctx.tau is not None:
++                terms = weight + 0.5 * teacher.exp() * (teacher - mixture)
++                weight = weight * (terms <= ctx.tau)
++                del terms
++            del teacher, mixture
++            chunk_grad = weight - probs * weight.sum(-1, keepdim=True)
++            grad[start:stop] = (chunk_grad * grad_out[start:stop, None]).to(grad.dtype)
++            del student, probs, weight, chunk_grad
++        return grad, None, None, None
++
++
++def chunked_jsd(student_logits: torch.Tensor, teacher_logits: torch.Tensor, tau: float | None = None,
++                chunk_size: int = 1024) -> dict[str, torch.Tensor]:
++    """Per-row JSD loss (``tau`` None: unclipped); see :class:`_ChunkedJSD`."""
++    if student_logits.shape != teacher_logits.shape:
++        raise ValueError(
++            f"student/teacher logits differ: {tuple(student_logits.shape)} vs {tuple(teacher_logits.shape)}"
++        )
++    if tau is not None and tau <= 0:
++        raise ValueError("the JSD contribution clip threshold must be positive")
++    names = ("loss", "jsd", "forward_kl", "reverse_kl", "clipped_positive_mass", "clipped_vocab")
++    outs = _ChunkedJSD.apply(student_logits, teacher_logits.detach(), None if tau is None else float(tau),
++                             int(chunk_size))
++    return dict(zip(names, outs, strict=True))
+diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+index a7256fd..c225aa6 100644
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -677,15 +677,168 @@ class RayPPOTrainer:
+     ) -> Optional[tuple[DataProto, dict[str, float]]]:
+         self_distillation_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
+         loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
+-        if self_distillation_cfg is None or loss_mode != "sdpo":
++        if self_distillation_cfg is None or loss_mode not in {"sdpo", "seed"}:
+             return None
+ 
+         device = batch.batch["input_ids"].device
+         response_mask = batch.batch["response_mask"]
+         responses = batch.batch["responses"]
++        batch_size = batch.batch.batch_size[0]
++
++        if loss_mode == "seed":
++            from leaf.baselines.seed_analyzer import (
++                analyzer_content_from_prompt,
++                validate_seed_skill,
++            )
++
++            feedback = (reward_extra_infos_dict or {}).get("feedback", [""] * batch_size)
++            scores = (reward_extra_infos_dict or {}).get("score")
++            if len(feedback) != batch_size:
++                raise ValueError("SEED requires one public-feedback record per trajectory")
++            if scores is None:
++                scores = reward_tensor.sum(dim=-1).detach().cpu().tolist()
++            if len(scores) != batch_size:
++                raise ValueError("SEED requires one correctness value per trajectory")
++
++            valid_lengths = response_mask.sum(dim=-1).detach().cpu().tolist()
++            response_texts = [
++                self.tokenizer.decode(
++                    responses[index, : int(valid_lengths[index])],
++                    skip_special_tokens=True,
++                )
++                for index in range(batch_size)
++            ]
++            problem_prompts = [
++                str(list(messages)[-1]["content"])
++                for messages in batch.non_tensor_batch["raw_prompt"]
++            ]
++            analysis_messages = [
++                [{
++                    "role": "user",
++                    "content": analyzer_content_from_prompt(
++                        problem_prompts[index],
++                        response_texts[index],
++                        str(feedback[index]),
++                        float(scores[index]) >= 1.0,
++                    ),
++                }]
++                for index in range(batch_size)
++            ]
++            analysis_prompt_ids = [
++                self.tokenizer.apply_chat_template(
++                    messages,
++                    tokenize=True,
++                    add_generation_prompt=True,
++                    enable_thinking=False,
++                )
++                for messages in analysis_messages
++            ]
++            max_skill_tokens = int(self.config.algorithm.seed.skill_max_tokens)
++            max_model_len = int(self.config.actor_rollout_ref.rollout.max_model_len)
++            overlong = [
++                index for index, values in enumerate(analysis_prompt_ids)
++                if len(values) + max_skill_tokens > max_model_len
++            ]
++            if overlong:
++                raise ValueError(
++                    "SEED analyzer prompt exceeds the frozen model context at "
++                    f"sample {overlong[0]}: prompt={len(analysis_prompt_ids[overlong[0]])}, "
++                    f"completion={max_skill_tokens}, max={max_model_len}"
++                )
++            analyzer_seed = int(self.config.algorithm.seed.analyzer_seed)
++            params = [
++                {
++                    "temperature": float(self.config.algorithm.seed.analyzer_temperature),
++                    "top_p": 1.0,
++                    "top_k": -1,
++                    "max_tokens": max_skill_tokens,
++                    "seed": analyzer_seed + self.global_steps * batch_size + index,
++                    "logprobs": False,
++                }
++                for index in range(batch_size)
++            ]
++            analysis_outputs = self.async_rollout_manager.generate_raw(
++                analysis_prompt_ids,
++                params,
++                request_prefix=f"seed-analysis-step-{self.global_steps}",
++            )
++            raw_skills = [
++                self.tokenizer.decode(output.token_ids, skip_special_tokens=True)
++                for output in analysis_outputs
++            ]
++            validation = [
++                validate_seed_skill(
++                    raw_skills[index], response_texts[index], self.tokenizer,
++                    max_tokens=max_skill_tokens,
++                )
++                for index in range(batch_size)
++            ]
++            skills = [item[2] if item[0] else "" for item in validation]
++            has_skill = [bool(item[0]) for item in validation]
++            teacher_messages = []
++            for index, raw_messages in enumerate(batch.non_tensor_batch["raw_prompt"]):
++                raw_messages = list(raw_messages)
++                if has_skill[index]:
++                    enriched = (
++                        f"{problem_prompts[index]}\n\nHindsight Skill:\n{skills[index]}\n\n"
++                        "Use the Skill as guidance and return one complete Python solution."
++                    )
++                    teacher_messages.append(
++                        raw_messages[:-1] + [{"role": "user", "content": enriched}]
++                    )
++                else:
++                    teacher_messages.append(raw_messages)
++
++            teacher_prompt = self.tokenizer.apply_chat_template(
++                teacher_messages,
++                tokenize=True,
++                return_tensors="pt",
++                return_dict=True,
++                continue_final_message=False,
++                add_generation_prompt=True,
++                enable_thinking=False,
++                max_length=self_distillation_cfg.max_reprompt_len,
++                padding=True,
++                truncation=True,
++            )
++            teacher_input_ids = torch.cat(
++                [teacher_prompt["input_ids"].to(device), responses], dim=1
++            )
++            teacher_attention_mask = torch.cat(
++                [teacher_prompt["attention_mask"].to(device), response_mask], dim=1
++            )
++            teacher_position_ids = compute_position_id_with_mask(teacher_attention_mask)
++            self_distillation_mask = torch.tensor(
++                has_skill, dtype=torch.float32, device=device
++            )
++            skill_token_counts = [
++                len(self.tokenizer.encode(skill, add_special_tokens=False))
++                for skill in skills if skill
++            ]
++            reasons = [item[1] for item in validation if not item[0]]
++            metrics = {
++                "seed/analyzer_requests": float(batch_size),
++                "seed/analyzer_prompt_tokens": float(sum(map(len, analysis_prompt_ids))),
++                "seed/analyzer_completion_tokens": float(
++                    sum(len(output.token_ids) for output in analysis_outputs)
++                ),
++                "seed/valid_skill_fraction": self_distillation_mask.mean().item(),
++                "seed/skill_tokens_mean": (
++                    float(np.mean(skill_token_counts)) if skill_token_counts else 0.0
++                ),
++                "seed/skill_rejected_empty": float(reasons.count("empty")),
++                "seed/skill_rejected_code_block": float(reasons.count("code_block")),
++                "seed/skill_rejected_overlap": float(reasons.count("response_overlap")),
++            }
++            return DataProto.from_dict(tensors={
++                "teacher_input_ids": teacher_input_ids,
++                "teacher_attention_mask": teacher_attention_mask,
++                "teacher_position_ids": teacher_position_ids,
++                "self_distillation_mask": self_distillation_mask,
++            }), metrics
++
+         response_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in responses]
+         prompt_texts = [msgs[-1]["content"] for msgs in batch.non_tensor_batch["raw_prompt"]]
+-        batch_size = batch.batch.batch_size[0]
+ 
+         # Extract feedback if available and include_environment_feedback is enabled
+         feedback_list = self._collect_feedback(
+@@ -708,7 +861,7 @@ class RayPPOTrainer:
+         ]
+ 
+         def _build_teacher_message(i: int) -> list[dict]:
+-            system_messages = batch.non_tensor_batch["raw_prompt"][i][:-1]
++            system_messages = list(batch.non_tensor_batch["raw_prompt"][i][:-1])
+             has_solution = solution_strs[i] is not None
+             has_feedback = feedback_list[i] is not None
+             feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
+@@ -795,6 +948,102 @@ class RayPPOTrainer:
+             "self_distillation_mask": self_distillation_mask,
+         }), metrics
+ 
++    # Non-tensor columns the LLM-judge rewarding phase adds; the naive reward
++    # manager forwards them to the reward function through extra_info.
++    JUDGE_COLUMNS = ("judge_verdict", "score_first_judge", "score_second_judge")
++
++    def _judge_phase(self, batch: DataProto, timing_raw: dict, metrics: dict) -> None:
++        """LLM-judge rewarding phase: the base model judges open SciKnowEval responses.
++
++        Rows whose verifier payload has ``kind == "sciqa_judge"`` get one greedy
++        judge request per response (two for SCoRe, one per turn) on the rollout
++        vLLM engine with the LoRA disabled, i.e. the frozen base model. The
++        verdict records (:func:`leaf.verifiers.llm_judge.verdict_record`) go into
++        ``non_tensor_batch`` for the reward function to read; nothing is judged
++        when no row needs it, so every other benchmark runs unchanged.
++        """
++        rows = batch.non_tensor_batch.get("reward_model")
++        if rows is None:
++            return
++        from leaf.verifiers import llm_judge
++        from leaf.core.project_config import load_config as load_project_config
++
++        payloads = []
++        for item in rows:
++            ground_truth = item.get("ground_truth") if isinstance(item, dict) else None
++            payload = None
++            if isinstance(ground_truth, str) and llm_judge.KIND in ground_truth:
++                payload = json.loads(ground_truth)
++            payloads.append(payload if llm_judge.needs_judge(payload) else None)
++        indices = [index for index, payload in enumerate(payloads) if payload is not None]
++        if not indices:
++            return
++        with marked_timer("judge", timing_raw, color="yellow"):
++            jobs: list[tuple[int, str, str]] = []
++            if "score_first_response" in batch.non_tensor_batch:
++                for index in indices:
++                    jobs.append((index, "score_first_judge",
++                                 str(batch.non_tensor_batch["score_first_response"][index])))
++                    jobs.append((index, "score_second_judge",
++                                 str(batch.non_tensor_batch["score_second_response"][index])))
++            else:
++                # Exactly the text the naive reward manager hands the reward.
++                prompt_length = batch.batch["prompts"].shape[-1]
++                for index in indices:
++                    valid = int(batch.batch["attention_mask"][index, prompt_length:].sum())
++                    text = self.tokenizer.decode(
++                        batch.batch["responses"][index, :valid], skip_special_tokens=True
++                    )
++                    jobs.append((index, "judge_verdict", text))
++            project = load_project_config()
++            max_model_len = int(self.config.actor_rollout_ref.rollout.max_model_len)
++            prompt_ids, contents, infos, params = [], [], [], []
++            for number, (index, _, text) in enumerate(jobs):
++                ids, content, info = llm_judge.prompt_ids(self.tokenizer, payloads[index], text)
++                values = llm_judge.sampling_params(
++                    project,
++                    llm_judge.JUDGE_SEED_OFFSET + self.global_steps * 100_000 + number,
++                )
++                values["max_tokens"] = max(1, min(values["max_tokens"], max_model_len - len(ids)))
++                values["logprobs"] = False
++                prompt_ids.append(ids)
++                contents.append(content)
++                infos.append(info)
++                params.append(values)
++            limits = [values["max_tokens"] for values in params]
++            started = time.monotonic()
++            outputs = self.async_rollout_manager.generate_raw(
++                prompt_ids, params, request_prefix=f"judge:{self.global_steps}", use_lora=False,
++            )
++            seconds = time.monotonic() - started
++            columns = {}
++            verdicts, parsed, lengths = [], [], []
++            for (index, column, _), ids, content, info, output, limit in zip(
++                jobs, prompt_ids, contents, infos, outputs, limits, strict=True
++            ):
++                token_ids = list(output.token_ids)
++                record = llm_judge.verdict_record(
++                    prompt=content,
++                    output=self.tokenizer.decode(token_ids, skip_special_tokens=True),
++                    info=info, prompt_tokens=len(ids), completion_tokens=len(token_ids),
++                    finish_reason="length" if len(token_ids) >= limit else "stop",
++                )
++                if column not in columns:
++                    columns[column] = np.empty(len(batch), dtype=object)
++                columns[column][index] = record
++                verdicts.append(record["verdict"])
++                parsed.append(record["parsed"])
++                lengths.append(len(token_ids))
++            batch.non_tensor_batch.update(columns)
++        metrics.update({
++            "judge/requests": len(jobs),
++            "judge/yes_fraction": float(np.mean(verdicts)),
++            "judge/unparsed_fraction": 1.0 - float(np.mean(parsed)),
++            "judge/completion_tokens_mean": float(np.mean(lengths)),
++            "judge/completion_tokens_max": int(np.max(lengths)),
++            "judge/seconds": seconds,
++        })
++
+     def _get_gen_batch(self, batch: DataProto) -> DataProto:
+         reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid", "raw_prompt"}) & batch.non_tensor_batch.keys()
+ 
+@@ -812,6 +1061,31 @@ class RayPPOTrainer:
+ 
+         return gen_batch
+ 
++    def _maybe_add_score_kl_coefficients(self, batch: DataProto) -> None:
++        """Attach SCoRe's frozen per-token reference-KL coefficients."""
++        score_cfg = self.config.actor_rollout_ref.actor.get("score", None)
++        if not score_cfg or not score_cfg.get("enabled", False):
++            return
++        extra_infos = batch.non_tensor_batch.get("extra_info")
++        turn1_lengths = batch.non_tensor_batch.get("score_turn1_tokens")
++        if extra_infos is None or turn1_lengths is None:
++            raise ValueError("SCoRe batch is missing stage metadata or turn-1 boundaries.")
++        response_mask = batch.batch["response_mask"]
++        coefficients = torch.zeros_like(response_mask, dtype=torch.float32)
++        beta1 = float(score_cfg.beta1)
++        beta2 = float(score_cfg.beta2)
++        for index, (extra_info, turn1_length) in enumerate(
++            zip(extra_infos, turn1_lengths, strict=True)
++        ):
++            stage = extra_info.get("score_stage")
++            if stage == "stage1":
++                coefficients[index, : int(turn1_length)] = beta2
++            elif stage == "stage2":
++                coefficients[index] = response_mask[index].to(coefficients.dtype) * beta1
++            else:
++                raise ValueError(f"Unknown SCoRe stage: {stage!r}")
++        batch.batch["score_kl_coef"] = coefficients
++
+     def _validate(self, merged: bool = False):
+         data_source_lst = []
+         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
+@@ -1243,8 +1517,20 @@ class RayPPOTrainer:
+         local_latest_checkpointed_iteration = os.path.join(
+             self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
+         )
+-        with open(local_latest_checkpointed_iteration, "w") as f:
++        temporary_tracker = local_latest_checkpointed_iteration + ".tmp"
++        with open(temporary_tracker, "w") as f:
+             f.write(str(self.global_steps))
++        os.replace(temporary_tracker, local_latest_checkpointed_iteration)
++
++        # Keep only the newest checkpoint (adapter + optimizer + extra + data.pt).
++        # Pruning happens after the tracker points at the new one, so a crash at
++        # any point leaves one complete, resumable checkpoint.
++        if self.config.trainer.get("keep_only_latest_checkpoint", True):
++            from verl.utils.checkpoint.lora_resume import prune_checkpoints
++
++            removed = prune_checkpoints(self.config.trainer.default_local_dir, self.global_steps)
++            if removed:
++                print(f"Pruned {len(removed)} older checkpoint(s): {[os.path.basename(p) for p in removed]}")
+ 
+     def _load_checkpoint(self):
+         if self.config.trainer.resume_mode == "disable":
+@@ -1297,11 +1583,11 @@ class RayPPOTrainer:
+         # load dataloader,
+         # TODO: from remote not implemented yet
+         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
+-        if os.path.exists(dataloader_local_path):
+-            dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
+-            self.train_dataloader.load_state_dict(dataloader_state_dict)
+-        else:
+-            print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
++        if not os.path.exists(dataloader_local_path):
++            raise RuntimeError(f"Resume from {global_step_folder}: dataloader state {dataloader_local_path} is missing")
++        dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
++        self.train_dataloader.load_state_dict(dataloader_state_dict)
++        print(f"Loaded dataloader state from {dataloader_local_path}")
+ 
+     def _start_profiling(self, do_profile: bool) -> None:
+         """Start profiling for all worker groups if profiling is enabled."""
+@@ -1688,6 +1974,7 @@ class RayPPOTrainer:
+ 
+                     if "response_mask" not in batch.batch.keys():
+                         batch.batch["response_mask"] = compute_response_mask(batch)
++                    self._maybe_add_score_kl_coefficients(batch)
+                     # Balance the number of valid tokens across DP ranks.
+                     # NOTE: This usually changes the order of data in the `batch`,
+                     # which won't affect the advantage calculation (since it's based on uid),
+@@ -1704,6 +1991,9 @@ class RayPPOTrainer:
+                             continue
+                         images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
+                     batch.meta_info["images_seqlens"] = images_seqlens_all
++                    # LLM-judge verdicts for open SciKnowEval rows, generated
++                    # before the reward function reads them.
++                    self._judge_phase(batch, timing_raw, metrics)
+                     with marked_timer("reward", timing_raw, color="yellow"):
+                         # compute reward model score
+                         if self.use_rm and "rm_scores" not in batch.batch.keys():
+@@ -1723,6 +2013,10 @@ class RayPPOTrainer:
+                             reward_tensor, reward_extra_infos_dict = self._compute_or_extract_reward(
+                                 batch, reward_fn=self.reward_fn, return_dict=False
+                             )
++                        # The verdicts now travel in the reward's extra info;
++                        # the actor workers never need the judge records.
++                        for column in self.JUDGE_COLUMNS:
++                            batch.non_tensor_batch.pop(column, None)
+ 
+                     # Operating Mode Selection:
+                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
+diff --git a/verl/utils/checkpoint/checkpoint_manager.py b/verl/utils/checkpoint/checkpoint_manager.py
+index 9f48147..b0c9cfd 100644
+--- a/verl/utils/checkpoint/checkpoint_manager.py
++++ b/verl/utils/checkpoint/checkpoint_manager.py
+@@ -220,8 +220,9 @@ def find_latest_ckpt_path(path, directory_format="global_step_{}"):
+         iteration = int(f.read().decode())
+     ckpt_path = os.path.join(path, directory_format.format(iteration))
+     if not os.path.exists(ckpt_path):
+-        print("Checkpoint does not exist: %s", ckpt_path)
+-        return None
++        # A tracker that points at a missing directory used to fall back to
++        # training from scratch silently; a resume must never do that.
++        raise FileNotFoundError(f"Checkpoint tracker {tracker_file} points at missing {ckpt_path}")
+ 
+     print("Found checkpoint: %s", ckpt_path)
+     return ckpt_path
+diff --git a/verl/utils/checkpoint/lora_resume.py b/verl/utils/checkpoint/lora_resume.py
+new file mode 100644
+index 0000000..cfbbd2c
+--- /dev/null
++++ b/verl/utils/checkpoint/lora_resume.py
+@@ -0,0 +1,188 @@
++# Project addition: LoRA-aware checkpoint resume.
++#
++# verl's FSDPCheckpointManager only restores the sharded *model* state, which the
++# LoRA runs never save (save_contents=[optimizer,extra]); the trained adapter is
++# exported beside the shards as <ckpt>/lora_adapter and was never read back, so
++# every mid-run resume silently restarted the LoRA from B = 0 (or from the SEED
++# SFT adapter).  This module restores the adapter (and SDPO's EMA teacher
++# adapter) into the FSDP module and verifies the restore bit for bit, and holds
++# the hard checks that make a partial resume fail loudly.
++
++import glob
++import os
++import re
++import shutil
++from contextlib import nullcontext
++
++import torch
++
++ADAPTER_DIR = "lora_adapter"
++EMA_ADAPTER_DIR = "ema_lora_adapter"
++ADAPTER_FILE = "adapter_model.safetensors"
++_WRAPPER_TOKENS = ("_fsdp_wrapped_module.", "_checkpoint_wrapped_module.", "_orig_mod.")
++
++
++class ResumeError(RuntimeError):
++    """A resume that would not restore the full training state."""
++
++
++def adapter_file(checkpoint_dir: str, name: str = ADAPTER_DIR) -> str:
++    return os.path.join(checkpoint_dir, name, ADAPTER_FILE)
++
++
++def read_adapter(path: str) -> dict:
++    from safetensors.torch import load_file
++
++    if not os.path.exists(path):
++        raise ResumeError(f"LoRA resume: adapter file is missing: {path}")
++    return load_file(path, device="cpu")
++
++
++def lora_norms(params: dict) -> dict:
++    """Frobenius norm over all lora_A and over all lora_B tensors."""
++    sums = {"lora_A": 0.0, "lora_B": 0.0}
++    for key, value in params.items():
++        for part in sums:
++            if f".{part}." in key:
++                sums[part] += float(value.detach().double().pow(2).sum())
++    return {part: total**0.5 for part, total in sums.items()}
++
++
++def _peft_key(name: str, adapter_name: str) -> str:
++    for token in _WRAPPER_TOKENS:
++        name = name.replace(token, "")
++    # get_peft_model_state_dict drops the adapter name the same way.
++    return name.replace(f".{adapter_name}", "")
++
++
++def _full_params_ctx(module):
++    from verl.utils.fsdp_utils import fsdp_version
++
++    version = fsdp_version(module)
++    if version == 0:
++        return nullcontext()
++    if version == 1:
++        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
++
++        return FSDP.summon_full_params(module, writeback=True, recurse=True)
++    raise NotImplementedError("LoRA resume supports FSDP1 and plain modules only")
++
++
++def load_lora_params(module, params: dict, adapter_name: str = "default") -> int:
++    """Copy a saved PEFT adapter state dict into ``module``'s LoRA parameters.
++
++    Every tensor of the file must land on a parameter and every LoRA parameter
++    of the module must be covered, otherwise this raises.
++    """
++    remaining = dict(params)
++    uncovered = []
++    loaded = 0
++    marker = f".{adapter_name}."
++    with _full_params_ctx(module), torch.no_grad():
++        for name, param in module.named_parameters():
++            key = _peft_key(name, adapter_name)
++            if "lora_" not in key:
++                continue
++            # another adapter of a multi-adapter module (a no-op with one
++            # adapter: every LoRA parameter name carries ".default.")
++            if marker not in name:
++                continue
++            if key not in remaining:
++                uncovered.append(key)
++                continue
++            source = remaining.pop(key)
++            if tuple(source.shape) != tuple(param.shape):
++                raise ResumeError(
++                    f"LoRA resume: shape mismatch for {key}: file {tuple(source.shape)} vs model {tuple(param.shape)}"
++                )
++            param.data.copy_(source.to(device=param.device, dtype=param.dtype))
++            loaded += 1
++    if remaining:
++        raise ResumeError(f"LoRA resume: {len(remaining)} adapter tensors match no parameter, e.g. {next(iter(remaining))}")
++    if uncovered:
++        raise ResumeError(f"LoRA resume: {len(uncovered)} LoRA parameters not in the adapter file, e.g. {uncovered[0]}")
++    if loaded == 0:
++        raise ResumeError("LoRA resume: the model has no LoRA parameters")
++    return loaded
++
++
++def current_lora_params(module, adapter_name: str = "default") -> dict:
++    """The module's adapter, gathered exactly as the checkpoint writer does."""
++    from verl.utils.fsdp_utils import fsdp_version, layered_summon_lora_params
++
++    if fsdp_version(module) > 0:
++        return layered_summon_lora_params(module, adapter_name=adapter_name)
++    from peft.utils.save_and_load import get_peft_model_state_dict
++
++    return {k: v.detach().cpu() for k, v in get_peft_model_state_dict(module, adapter_name=adapter_name).items()}
++
++
++def verify_lora_params(module, expected: dict, label: str, adapter_name: str = "default") -> dict:
++    """Raise unless the module's adapter equals ``expected`` exactly."""
++    actual = current_lora_params(module, adapter_name=adapter_name)
++    if set(actual) != set(expected):
++        missing = sorted(set(expected) - set(actual))[:3]
++        extra = sorted(set(actual) - set(expected))[:3]
++        raise ResumeError(f"LoRA resume ({label}): key sets differ; missing {missing}, unexpected {extra}")
++    for key, value in expected.items():
++        if not torch.equal(actual[key].to(value.dtype), value):
++            diff = float((actual[key].double() - value.double()).abs().max())
++            raise ResumeError(f"LoRA resume ({label}): {key} differs from the checkpoint (max abs diff {diff:.3e})")
++    saved, loaded = lora_norms(expected), lora_norms(actual)
++    if saved["lora_B"] > 0 and loaded["lora_B"] == 0:
++        raise ResumeError(f"LoRA resume ({label}): loaded lora_B norm is 0 but the checkpoint's is {saved['lora_B']}")
++    return {"saved": saved, "loaded": loaded, "tensors": len(expected)}
++
++
++def restore_adapter(module, checkpoint_dir: str, name: str, label: str, adapter_name: str = "default") -> dict:
++    """Load <checkpoint_dir>/<name> into ``module`` and verify it; returns norms."""
++    params = read_adapter(adapter_file(checkpoint_dir, name))
++    loaded = load_lora_params(module, params, adapter_name=adapter_name)
++    report = verify_lora_params(module, params, label, adapter_name=adapter_name)
++    report["loaded_tensors"] = loaded
++    print(
++        f"[lora_resume] Loaded {label} adapter from {os.path.join(checkpoint_dir, name)}: "
++        f"{loaded} tensors, lora_B norm saved={report['saved']['lora_B']:.6f} "
++        f"loaded={report['loaded']['lora_B']:.6f}, lora_A norm saved={report['saved']['lora_A']:.6f} "
++        f"loaded={report['loaded']['lora_A']:.6f}",
++        flush=True,
++    )
++    return report
++
++
++def assert_resume_contents(checkpoint_manager, checkpoint_dir: str, is_lora: bool) -> None:
++    """Hard checks before a LoRA resume: all three parts must be loadable."""
++    if not is_lora:
++        return
++    contents = list(checkpoint_manager.checkpoint_load_contents)
++    for required in ("optimizer", "extra"):
++        if required not in contents:
++            raise ResumeError(
++                f"LoRA resume from {checkpoint_dir} with load_contents={contents}: '{required}' must be loaded "
++                "(set checkpoint.load_contents=[optimizer,extra])"
++            )
++    world, rank = checkpoint_manager.world_size, checkpoint_manager.rank
++    for stem in ("optim", "extra_state"):
++        path = os.path.join(checkpoint_dir, f"{stem}_world_size_{world}_rank_{rank}.pt")
++        if not os.path.exists(path):
++            raise ResumeError(f"LoRA resume: {path} is missing from the checkpoint being resumed")
++    path = adapter_file(checkpoint_dir)
++    if not os.path.exists(path):
++        raise ResumeError(f"LoRA resume: adapter {path} is missing from the checkpoint being resumed")
++
++
++def prune_checkpoints(root: str, keep_step: int) -> list:
++    """Delete every global_step_* directory under ``root`` except ``keep_step``.
++
++    Called only after the new checkpoint and the tracker file are written, so a
++    crash at any point leaves at least one complete checkpoint on disk.
++    """
++    keep = os.path.abspath(os.path.join(root, f"global_step_{keep_step}"))
++    if not os.path.isdir(keep):
++        raise ResumeError(f"refusing to prune: the checkpoint to keep does not exist: {keep}")
++    removed = []
++    for path in glob.glob(os.path.join(root, "global_step_*")):
++        if re.fullmatch(r"global_step_\d+", os.path.basename(path)) and os.path.abspath(path) != keep:
++            shutil.rmtree(path)
++            removed.append(path)
++    return removed
+diff --git a/verl/utils/fsdp_utils.py b/verl/utils/fsdp_utils.py
+index 9b0d48f..63ca9b3 100644
+--- a/verl/utils/fsdp_utils.py
++++ b/verl/utils/fsdp_utils.py
+@@ -566,7 +566,9 @@ def fsdp2_clip_grad_norm_(parameters, max_norm, norm_type=2.0, error_if_nonfinit
+     return total_norm
+ 
+ 
+-def layered_summon_lora_params(fsdp_module) -> OrderedDict:
++def layered_summon_lora_params(fsdp_module, adapter_name: str = "default") -> OrderedDict:
++    # adapter_name (project addition): which peft adapter to gather (the LoRA
++    # resume check reads the restored adapter back through it).
+     from peft.utils.save_and_load import get_peft_model_state_dict
+ 
+     def __prefix_submodules(module, prefix):
+@@ -595,7 +597,9 @@ def layered_summon_lora_params(fsdp_module) -> OrderedDict:
+                 continue
+             if fsdp_version(submodule) > 0:
+                 with FSDP.summon_full_params(submodule, writeback=False):
+-                    sub_lora_params = get_peft_model_state_dict(peft_model, state_dict=submodule.state_dict())
++                    sub_lora_params = get_peft_model_state_dict(
++                        peft_model, state_dict=submodule.state_dict(), adapter_name=adapter_name
++                    )
+                     sub_lora_params = {
+                         f"{prefix}.{name}": param.full_tensor().detach().cpu()
+                         if hasattr(param, "full_tensor")
+diff --git a/verl/utils/peft_compat.py b/verl/utils/peft_compat.py
+new file mode 100644
+index 0000000..7af2197
+--- /dev/null
++++ b/verl/utils/peft_compat.py
+@@ -0,0 +1,21 @@
++"""Compatibility helpers for loading PEFT adapters."""
++
++
++def ensure_peft_transformers_compatibility() -> bool:
++    """Make PEFT 0.19's no-TP loader work with Transformers 4.57.
++
++    PEFT imports ``EmbeddingParallel`` before it checks whether a layer has a
++    tensor-parallel plan.  Transformers 4.57 does not expose that newer class.
++    The sentinel is never selected by a non-TP model; a real unsupported
++    embedding-TP plan still reaches PEFT's explicit unknown-plan error.
++    """
++    from transformers.integrations import tensor_parallel
++
++    if hasattr(tensor_parallel, "EmbeddingParallel"):
++        return False
++
++    class EmbeddingParallelUnavailable:
++        pass
++
++    tensor_parallel.EmbeddingParallel = EmbeddingParallelUnavailable
++    return True
+diff --git a/verl/utils/reward_score/feedback/code.py b/verl/utils/reward_score/feedback/code.py
+index 5207fcf..2094160 100644
+--- a/verl/utils/reward_score/feedback/code.py
++++ b/verl/utils/reward_score/feedback/code.py
+@@ -6,6 +6,7 @@ import faulthandler
+ import io
+ import json
+ import multiprocessing
++import os
+ import re
+ import sys
+ import time
+@@ -15,11 +16,19 @@ from typing import Optional
+ 
+ import numpy as np
+ 
++# A candidate may print or return an integer with more than 4,300 digits;
++# formatting it for feedback must not raise (Python 3.11 int->str limit).
++import sys as _sys
++if hasattr(_sys, "set_int_max_str_digits"):
++    _sys.set_int_max_str_digits(0)
++
+ INCORRECT_FORMAT = "Incorrect format"
+ TIMEOUT = "Time out"
+ ERROR_PREFIX = "Error: "
+ OUTER_ERROR_PREFIX = "ERROR: "
+-MAX_ADDITIONAL_MEMORY_BYTES = 1024 * 1024 * 1024  # 1GB
++MAX_ADDITIONAL_MEMORY_BYTES = int(
++    float(os.environ.get("LEAF_CANDIDATE_MEMORY_GIB", "1")) * 1024 * 1024 * 1024
++)
+ DEFAULT_TIMEOUT = 1
+ TIMEOUT_SCALER = 1.0
+ FORMAT_PENALTY = False
+@@ -43,29 +52,34 @@ except Exception:  # pragma: no cover - platform may not provide resource
+ 
+ def set_memory_limits(maximum_memory_bytes: Optional[int]) -> None:
+     """
+-    Apply OS-level memory limits to the current process, if supported.
++    Limit memory that the candidate may add to the verifier child process.
+ 
+-    This uses RLIMIT_AS (address space) as the primary cap, and attempts
+-    RLIMIT_DATA and RLIMIT_RSS where available. It is a best-effort guard
+-    to prevent out-of-memory conditions from crashing the host.
++    The child inherits the verifier parent's already-loaded Python/NumPy address
++    space.  Setting RLIMIT_AS to the additional allowance itself makes ordinary
++    allocations fail whenever those inherited mappings already approach the
++    limit.  Anchor the cap at the child's current virtual size so the configured
++    value consistently means *additional* candidate memory.
+     """
+     if maximum_memory_bytes is None or maximum_memory_bytes <= 0 or _resource is None:
+         return
+ 
+     try:
+-        # Cap total address space; this is the most reliable on Linux.
++        current_virtual_bytes = 0
++        try:
++            with open("/proc/self/statm", encoding="ascii") as statm:
++                virtual_pages = int(statm.read().split()[0])
++            current_virtual_bytes = virtual_pages * os.sysconf("SC_PAGE_SIZE")
++        except Exception:
++            # /proc is Linux-specific.  Falling back to the former absolute cap
++            # retains a guard on other platforms rather than silently disabling it.
++            pass
++
+         if hasattr(_resource, "RLIMIT_AS"):
+-            _resource.setrlimit(_resource.RLIMIT_AS, (maximum_memory_bytes, maximum_memory_bytes))
+-        # Also try to cap data segment and resident set size when available.
+-        for limit_name in ("RLIMIT_DATA", "RLIMIT_RSS"):
+-            if hasattr(_resource, limit_name):
+-                limit_const = getattr(_resource, limit_name)
+-                try:
+-                    _resource.setrlimit(limit_const, (maximum_memory_bytes, maximum_memory_bytes))
+-                except Exception:
+-                    # Not all platforms allow setting these limits; ignore failures.
+-                    print("Failed to set memory limits")
+-                    pass
++            address_space_limit = current_virtual_bytes + maximum_memory_bytes
++            _resource.setrlimit(
++                _resource.RLIMIT_AS,
++                (address_space_limit, address_space_limit),
++            )
+     except Exception:
+         print("Failed to set memory limits")
+         pass
+@@ -762,58 +776,82 @@ def run_tests(test_cases: dict, solution, sparse_rewards, max_test_cases):
+     timeout_per_test_case = float(test_cases["time_limit"]) if test_cases["time_limit"] is not None else DEFAULT_TIMEOUT
+ 
+     records = []
+-    process_data = []
+-
+-    for test_idx in range(num_test_cases):
+-        parent_conn, child_conn = multiprocessing.Pipe(duplex=False)
+-        p = multiprocessing.Process(target=run_tests_for_one_example, args=(test_cases, completion, child_conn, sparse_rewards, test_idx))
+-        p.start()
+-        child_conn.close()  # Close in parent to avoid resource leaks
+-        process_data.append({"process": p, "parent_conn": parent_conn})
+-
+-    start_time = time.time()
+-    for test_idx, data in enumerate(process_data):
+-        p = data["process"]
+-        parent_conn = data["parent_conn"]
+-
+-        # timeout for a single test; since all tests have started in parallel, we need to calculate the remaining time for each test
+-        timeout_this_test = max(0, timeout_per_test_case * TIMEOUT_SCALER + 1 - (time.time() - start_time))
+-        if parent_conn.poll(timeout_this_test):
+-            try:
+-                # receive the result from the child process
+-                result = parent_conn.recv()
+-            except Exception as e:
+-                # any other error (eg process died without sending a result)
++    max_parallel = max(1, int(os.environ.get("LEAF_VERIFIER_WORKERS", str(num_test_cases))))
++    terminal_runtime_error = False
++    for batch_start in range(0, num_test_cases, max_parallel):
++        process_data = []
++        batch_end = min(batch_start + max_parallel, num_test_cases)
++        for test_idx in range(batch_start, batch_end):
++            parent_conn, child_conn = multiprocessing.Pipe(duplex=False)
++            p = multiprocessing.Process(
++                target=run_tests_for_one_example,
++                args=(test_cases, completion, child_conn, sparse_rewards, test_idx),
++            )
++            p.start()
++            child_conn.close()  # Close in parent to avoid resource leaks
++            process_data.append({"test_idx": test_idx, "process": p, "parent_conn": parent_conn})
++
++        start_time = time.time()
++        for process_index, data in enumerate(process_data):
++            test_idx = data["test_idx"]
++            p = data["process"]
++            parent_conn = data["parent_conn"]
++
++            # Each wave shares a wall-clock deadline, preserving the original
++            # per-test timeout while bounding concurrent child processes.
++            timeout_this_test = max(
++                0, timeout_per_test_case * TIMEOUT_SCALER + 1 - (time.time() - start_time)
++            )
++            if parent_conn.poll(timeout_this_test):
++                try:
++                    result = parent_conn.recv()
++                except Exception as e:
++                    result = {
++                        "test_idx": test_idx,
++                        "input": test_cases["inputs"][test_idx],
++                        "expected": test_cases["outputs"][test_idx],
++                        "actual": f"Process Error: {_short_trace(e)}",
++                        "passed": False,
++                        "debug": "",
++                        "time": float("inf"),
++                    }
++            else:
+                 result = {
+                     "test_idx": test_idx,
+                     "input": test_cases["inputs"][test_idx],
+                     "expected": test_cases["outputs"][test_idx],
+-                    "actual": f"Process Error: {_short_trace(e)}",
++                    "actual": TIMEOUT,
+                     "passed": False,
+                     "debug": "",
+                     "time": float("inf"),
+                 }
+-        else:
+-            # process timed out
+-            result = {
+-                "test_idx": test_idx,
+-                "input": test_cases["inputs"][test_idx],
+-                "expected": test_cases["outputs"][test_idx],
+-                "actual": TIMEOUT,
+-                "passed": False,
+-                "debug": "",
+-                "time": float("inf"),
+-            }
+-
+-        records.append(result)
+-
+-        # clean-up process
+-        p.join(timeout=0)
+-        if p.is_alive():
+-            p.kill()
+-            p.join()
+-
+-    assert len(records) == num_test_cases
++
++            records.append(result)
++            parent_conn.close()
++            p.join(timeout=0)
++            if p.is_alive():
++                p.kill()
++                p.join()
++
++            # format_test_feedback always selects the first runtime error over
++            # every wrong answer or timeout.  Once that record is known, later
++            # tests cannot change the binary reward or rendered feedback.
++            actual = result.get("actual")
++            if isinstance(actual, str) and actual.startswith(ERROR_PREFIX):
++                terminal_runtime_error = True
++                for pending in process_data[process_index + 1 :]:
++                    pending["parent_conn"].close()
++                    pending_process = pending["process"]
++                    pending_process.join(timeout=0)
++                    if pending_process.is_alive():
++                        pending_process.kill()
++                        pending_process.join()
++                break
++
++        if terminal_runtime_error:
++            break
++
++    assert records
+     return records
+ 
+ 
+diff --git a/verl/utils/torch_functional.py b/verl/utils/torch_functional.py
+index 8f87083..d37d84e 100644
+--- a/verl/utils/torch_functional.py
++++ b/verl/utils/torch_functional.py
+@@ -263,6 +263,60 @@ def entropy_from_logits_with_chunking(logits: torch.Tensor, chunk_size: int = 20
+     return entropy
+ 
+ 
++def topk_logprobs_from_logits_with_chunking(
++    logits: torch.Tensor,
++    topk: int | None = None,
++    topk_indices: torch.Tensor | None = None,
++    chunk_size: int = 2048,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Compute normalized top-k log-probabilities in bounded token chunks.
++
++    Chunking is over every dimension except the vocabulary dimension.  This
++    bounds the temporary vocabulary-sized tensors created by ``topk`` and
++    ``logsumexp`` while preserving gradients through the selected logits.
++    """
++    if chunk_size <= 0:
++        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
++    if logits.ndim < 2:
++        raise ValueError(f"logits must have at least two dimensions, got {logits.shape}")
++    if (topk is None) == (topk_indices is None):
++        raise ValueError("exactly one of topk and topk_indices must be provided")
++
++    prefix_shape = logits.shape[:-1]
++    vocab_size = logits.shape[-1]
++    flat_logits = logits.reshape(-1, vocab_size)
++    flat_indices = None
++    if topk_indices is not None:
++        if topk_indices.shape[:-1] != prefix_shape:
++            raise ValueError(
++                f"topk_indices shape {topk_indices.shape} does not match logits shape {logits.shape}"
++            )
++        flat_indices = topk_indices.reshape(-1, topk_indices.shape[-1])
++        k = topk_indices.shape[-1]
++    else:
++        k = min(int(topk), vocab_size)
++
++    logps_chunks = []
++    indices_chunks = []
++    for start in range(0, flat_logits.shape[0], chunk_size):
++        end = min(start + chunk_size, flat_logits.shape[0])
++        logits_chunk = flat_logits[start:end]
++        if flat_indices is None:
++            topk_logits_chunk, indices_chunk = torch.topk(logits_chunk, k, dim=-1)
++        else:
++            indices_chunk = flat_indices[start:end]
++            topk_logits_chunk = torch.gather(logits_chunk, dim=-1, index=indices_chunk)
++        normalizer_chunk = torch.logsumexp(logits_chunk, dim=-1, keepdim=True)
++        logps_chunks.append(topk_logits_chunk - normalizer_chunk)
++        indices_chunks.append(indices_chunk)
++
++    output_shape = (*prefix_shape, k)
++    return (
++        torch.cat(logps_chunks, dim=0).reshape(output_shape),
++        torch.cat(indices_chunks, dim=0).reshape(output_shape),
++    )
++
++
+ def masked_sum(values: torch.Tensor, mask: torch.Tensor, axis: int | tuple[int, ...] | None = None) -> torch.Tensor:
+     """Compute sum of tensor values where mask is True.
+ 
+diff --git a/verl/workers/actor/dp_actor.py b/verl/workers/actor/dp_actor.py
+index c35f057..5894ab3 100644
+--- a/verl/workers/actor/dp_actor.py
++++ b/verl/workers/actor/dp_actor.py
+@@ -29,9 +29,19 @@ from torch.distributed.tensor import DTensor
+ 
+ import verl.utils.torch_functional as verl_F
+ from verl import DataProto
+-from verl.trainer.ppo.core_algos import agg_loss, compute_self_distillation_loss, get_policy_loss_fn, kl_penalty
++from verl.trainer.ppo.core_algos import (
++    agg_loss,
++    compute_opd_loss,
++    chunked_full_vocab_kl,
++    chunked_high_clip_forward_kl,
++    chunked_high_clip_reverse_kl,
++    chunked_jsd,
++    compute_self_distillation_loss,
++    get_policy_loss_fn,
++    kl_penalty,
++)
+ from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
+-from verl.utils.device import get_device_id, get_device_name
++from verl.utils.device import get_device_id, get_device_name, get_torch_device
+ from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
+ from verl.utils.profiler import GPUMemoryLogger
+ from verl.utils.py_functional import append_to_dict
+@@ -42,6 +52,24 @@ from verl.utils.ulysses import gather_outputs_and_unpad, slice_input_tensor, uly
+ from verl.workers.actor import BasePPOActor
+ from verl.workers.config import ActorConfig
+ 
++# Full-vocabulary self-distillation toward the current policy under a privileged prompt
++# (``teacher_input_ids``, stop-grad teacher). Each step is one optimizer step whose loss is
++# an exact token mean over the step (DataParallelPPOActor._distill_update_policy).
++# Divergence variants: loss mode -> (divergence, high clip at meta_info["distill_clip_tau"]);
++# forward = KL(teacher || student), jsd = JSD_0.5.
++DIVERGENCE_LOSS_MODES = {
++    "distill_forward_kl": ("forward", False), "distill_forward_kl_clip": ("forward", True),
++    "distill_jsd": ("jsd", False), "distill_jsd_clip": ("jsd", True),
++}
++# distill_reverse_kl = reverse KL(student || teacher), distill_reverse_kl_clip = its
++# per-entry high clip.
++DISTILL_LOSS_MODES = ("distill_reverse_kl", "distill_reverse_kl_clip", *DIVERGENCE_LOSS_MODES)
++# SFT on the response tokens: NLL at temperature 1, an exact token mean over the step, one
++# optimizer step (DataParallelPPOActor._sft_update_policy); no teacher.
++SFT_LOSS_MODE = "sft_nll"
++# loss modes whose step carries meta_info["distill_clip_tau"]
++CLIPPED_DISTILL_LOSS_MODES = ("distill_reverse_kl_clip", "distill_forward_kl_clip", "distill_jsd_clip")
++
+ __all__ = ["DataParallelPPOActor"]
+ 
+ logger = logging.getLogger(__file__)
+@@ -129,10 +157,39 @@ class DataParallelPPOActor(BasePPOActor):
+                 f"{self.use_fused_kernels=} or {self.use_prefix_grouper=} for now."
+             )
+ 
++    def _teacher_student_trainable_pairs(self):
++        if self.teacher_module is None or self.teacher_module is self.actor_module:
++            raise ValueError("EMA teacher requires a separate teacher_module in the actor worker.")
++        teacher_parameters = dict(self.teacher_module.named_parameters())
++        trainable = 0
++        for name, student_param in self.actor_module.named_parameters():
++            if not student_param.requires_grad:
++                continue
++            if name not in teacher_parameters:
++                raise ValueError(f"EMA teacher is missing student parameter {name}")
++            teacher_param = teacher_parameters[name]
++            if teacher_param.shape != student_param.shape:
++                raise ValueError(
++                    f"EMA parameter shape mismatch for {name}: "
++                    f"teacher={teacher_param.shape}, student={student_param.shape}"
++                )
++            trainable += 1
++            yield teacher_param, student_param
++        if trainable == 0:
++            raise ValueError("EMA teacher found no trainable student parameters.")
++
++    def initialize_teacher(self) -> None:
++        """Initialize the EMA LoRA adapter exactly from the student adapter."""
++        with torch.no_grad():
++            for teacher_param, student_param in self._teacher_student_trainable_pairs():
++                teacher_param.data.copy_(student_param.data.to(device=teacher_param.device))
++        self.teacher_module.requires_grad_(False)
++        self.teacher_module.eval()
++
+     def _update_teacher(self) -> None:
+         self_distillation_cfg = getattr(self.config, "self_distillation", None)
+         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+-        if not self_distillation_cfg or loss_mode != "sdpo":
++        if not self_distillation_cfg or loss_mode not in {"sdpo", "seed"}:
+             return
+         teacher_regularization = getattr(self_distillation_cfg, "teacher_regularization", "ema")
+         if teacher_regularization != "ema":
+@@ -140,13 +197,8 @@ class DataParallelPPOActor(BasePPOActor):
+         update_rate = getattr(self_distillation_cfg, "teacher_update_rate", 0.0)
+         if update_rate == 0.0:
+             return
+-        if self.teacher_module is None or self.teacher_module is self.actor_module:
+-            raise ValueError("EMA teacher requires a separate teacher_module in the actor worker.")
+         with torch.no_grad():
+-            for teacher_param, student_param in zip(
+-                self.teacher_module.parameters(),
+-                self.actor_module.parameters(),
+-            ):
++            for teacher_param, student_param in self._teacher_student_trainable_pairs():
+                 student_data = student_param.data.to(device=teacher_param.device)
+                 teacher_param.data.mul_(1.0 - update_rate).add_(student_data, alpha=update_rate)
+ 
+@@ -180,6 +232,7 @@ class DataParallelPPOActor(BasePPOActor):
+         distill_topk: Optional[int] = None,
+         topk_indices: Optional[torch.Tensor] = None,
+         module: Optional[nn.Module] = None,
++        return_response_logits: bool = False,
+     ) -> dict[str, torch.Tensor]:
+         """
+         Returns:
+@@ -198,6 +251,7 @@ class DataParallelPPOActor(BasePPOActor):
+         use_topk = distill_topk is not None or topk_indices is not None
+         compute_all_logps = return_all_logps and not use_topk
+         return_topk_indices = use_topk and topk_indices is None
++        vocab_chunk_size = int(self.config.self_distillation.get("vocab_chunk_size", 2048))
+         if (return_all_logps or use_topk) and self.use_fused_kernels:
+             raise ValueError("Logit distillation requires disabling fused kernels.")
+ 
+@@ -212,6 +266,7 @@ class DataParallelPPOActor(BasePPOActor):
+                 and not self.use_dynamic_bsz
+                 and not return_all_logps
+                 and not use_topk
++                and not return_response_logits
+             )
+             if can_use_pg and "response_mask" in micro_batch and "uid" in micro_batch:
+                 from verl.trainer.ppo.prefix_grouper_utils import forward_micro_batch_with_prefix_grouper
+@@ -339,12 +394,27 @@ class DataParallelPPOActor(BasePPOActor):
+                 else:
+                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+                     logits_rmpad.div_(temperature)
++                    response_logits = None
++                    if return_response_logits:
++                        # full-vocabulary divergence: keep only the rows that
++                        # predict a response token, in (batch, position) order,
++                        # which is the order of response_mask[response_mask.bool()].
++                        if self.use_ulysses_sp:
++                            raise ValueError("return_response_logits does not support Ulysses SP")
++                        prediction_rows = torch.zeros_like(attention_mask, dtype=torch.bool)
++                        prediction_rows[:, -response_length - 1 : -1] = micro_batch["response_mask"].bool()
++                        prediction_rows = prediction_rows.reshape(-1)[indices]
++                        response_logits = logits_rmpad[prediction_rows]
++                        del prediction_rows
+                     all_logps_rmpad = torch.log_softmax(logits_rmpad, dim=-1) if compute_all_logps else None
+ 
+                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
+-                    inplace_backward = True
+-                    if calculate_entropy:
+-                        inplace_backward = False
++                    # The sampled-token log-prob and distillation branches
++                    # share logits.  FlashAttention's in-place CE backward is
++                    # only valid when no second logits consumer exists.
++                    inplace_backward = not (
++                        calculate_entropy or use_topk or compute_all_logps or return_response_logits
++                    )
+                     log_probs = logprobs_from_logits(
+                         logits=logits_rmpad,
+                         labels=input_ids_rmpad_rolled,
+@@ -363,7 +433,13 @@ class DataParallelPPOActor(BasePPOActor):
+                     if use_topk:
+                         if topk_indices is None:
+                             topk = min(distill_topk, logits_rmpad.shape[-1])
+-                            topk_logits_rmpad, topk_indices_rmpad = torch.topk(logits_rmpad, topk, dim=-1)
++                            topk_logps_rmpad, topk_indices_rmpad = (
++                                verl_F.topk_logprobs_from_logits_with_chunking(
++                                    logits_rmpad,
++                                    topk=topk,
++                                    chunk_size=vocab_chunk_size,
++                                )
++                            )
+                         else:
+                             topk = topk_indices.size(-1)
+                             full_topk_indices = torch.zeros(
+@@ -381,9 +457,11 @@ class DataParallelPPOActor(BasePPOActor):
+                                 topk_indices_rmpad = slice_input_tensor(
+                                     topk_indices_rmpad.unsqueeze(0), dim=1, padding=True
+                                 ).squeeze(0)
+-                            topk_logits_rmpad = torch.gather(logits_rmpad, dim=-1, index=topk_indices_rmpad)
+-                        logsumexp_rmpad = torch.logsumexp(logits_rmpad, dim=-1, keepdim=True)
+-                        topk_logps_rmpad = topk_logits_rmpad - logsumexp_rmpad
++                            topk_logps_rmpad, _ = verl_F.topk_logprobs_from_logits_with_chunking(
++                                logits_rmpad,
++                                topk_indices=topk_indices_rmpad,
++                                chunk_size=vocab_chunk_size,
++                            )
+ 
+                     # Compute sum_pi_squared if requested (for optimal_token_baseline)
+                     if calculate_sum_pi_squared:
+@@ -522,17 +600,27 @@ class DataParallelPPOActor(BasePPOActor):
+ 
+                     logits.div_(temperature)
+                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+-                    log_probs = logprobs_from_logits(logits, micro_batch["responses"])
++                    log_probs = logprobs_from_logits(
++                        logits,
++                        micro_batch["responses"],
++                        inplace_backward=not (calculate_entropy or use_topk or compute_all_logps),
++                    )
+                     if compute_all_logps:
+                         all_logps = torch.log_softmax(logits, dim=-1)
+                     if use_topk:
+                         if topk_indices is None:
+                             topk = min(distill_topk, logits.size(-1))
+-                            topk_logits, topk_indices = torch.topk(logits, topk, dim=-1)
++                            topk_logps, topk_indices = verl_F.topk_logprobs_from_logits_with_chunking(
++                                logits,
++                                topk=topk,
++                                chunk_size=vocab_chunk_size,
++                            )
+                         else:
+-                            topk_logits = torch.gather(logits, dim=-1, index=topk_indices)
+-                        logsumexp = torch.logsumexp(logits, dim=-1, keepdim=True)
+-                        topk_logps = topk_logits - logsumexp
++                            topk_logps, _ = verl_F.topk_logprobs_from_logits_with_chunking(
++                                logits,
++                                topk_indices=topk_indices,
++                                chunk_size=vocab_chunk_size,
++                            )
+                     if calculate_entropy:
+                         if not self.config.entropy_checkpointing:
+                             entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
+@@ -547,6 +635,10 @@ class DataParallelPPOActor(BasePPOActor):
+                         )
+ 
+             outputs = {"log_probs": log_probs}
++            if return_response_logits:
++                if not self.use_remove_padding or self.use_fused_kernels:
++                    raise ValueError("return_response_logits requires remove_padding without fused kernels")
++                outputs["response_logits"] = response_logits
+             if calculate_entropy:
+                 outputs["entropys"] = entropy
+             if calculate_sum_pi_squared:
+@@ -672,6 +764,230 @@ class DataParallelPPOActor(BasePPOActor):
+             outputs["sum_pi_squared"] = sum_pi_squared
+         return outputs
+ 
++    def _full_vocab_divergence_loss(self, model_inputs, temperature, loss_agg_mode, clip_tau=None,
++                                    divergence=None):
++        """Token-level full-vocabulary divergence between student and privileged teacher.
++
++        Both sides are the current policy; the teacher reads
++        ``teacher_input_ids`` (privileged prompt + the same response) under
++        no_grad. Only the logits of response-predicting rows are kept, and the
++        divergence is computed in row chunks (see ``chunked_full_vocab_kl``).
++
++        ``divergence`` None: the reverse KL (``self_distillation.alpha`` 1; 0 = forward
++        KL), high-clipped per vocabulary entry at ``clip_tau`` when given. ``"forward"`` /
++        ``"jsd"``: KL(teacher || student) / JSD_0.5, high-clipped per vocabulary entry at
++        ``clip_tau`` when given.
++        """
++        cfg = self.config.self_distillation
++        if divergence is None:
++            alpha = float(cfg.alpha)
++            if alpha not in (0.0, 1.0):
++                raise ValueError("the full-vocabulary KL supports alpha 1 (reverse KL) or 0 (forward KL)")
++        elif divergence not in ("forward", "jsd"):
++            raise ValueError(f"unknown divergence {divergence!r}")
++        chunk = int(cfg.get("vocab_chunk_size", 1024))
++        response_mask = model_inputs["response_mask"]
++        student = self._forward_micro_batch(
++            model_inputs, temperature=temperature, calculate_entropy=False,
++            return_response_logits=True,
++        )
++        teacher_inputs = {
++            "responses": model_inputs["responses"],
++            "response_mask": response_mask,
++            "input_ids": model_inputs["teacher_input_ids"],
++            "attention_mask": model_inputs["teacher_attention_mask"],
++            "position_ids": model_inputs["teacher_position_ids"],
++        }
++        with torch.no_grad():
++            teacher = self._forward_micro_batch(
++                teacher_inputs, temperature=temperature, calculate_entropy=False,
++                return_response_logits=True,
++            )
++        clip_stats = None
++        divergence_stats = None
++        if divergence == "forward":
++            if clip_tau is None:
++                rows = chunked_full_vocab_kl(
++                    student["response_logits"], teacher["response_logits"], reverse=False, chunk_size=chunk)
++            else:
++                # sum_v min(t_v log(t_v / s_v), tau)
++                divergence_stats = chunked_high_clip_forward_kl(
++                    student["response_logits"], teacher["response_logits"], float(clip_tau), chunk)
++                rows = divergence_stats["loss"]
++        elif divergence == "jsd":
++            divergence_stats = chunked_jsd(
++                student["response_logits"], teacher["response_logits"],
++                None if clip_tau is None else float(clip_tau), chunk)
++            rows = divergence_stats["loss"]
++        elif clip_tau is None:
++            rows = chunked_full_vocab_kl(
++                student["response_logits"], teacher["response_logits"],
++                reverse=alpha == 1.0, chunk_size=chunk,
++            )
++        else:
++            # sum_v min(s_v log(s_v / t_v), tau) (reverse only)
++            if alpha != 1.0:
++                raise ValueError("distill_reverse_kl_clip clips the reverse KL (alpha 1)")
++            clip_stats = chunked_high_clip_reverse_kl(
++                student["response_logits"], teacher["response_logits"], float(clip_tau), chunk)
++            rows = clip_stats["loss"]
++        teacher_log_prob = teacher["log_probs"]
++        del teacher
++        mask = response_mask.bool()
++        per_token = torch.zeros(response_mask.shape, dtype=rows.dtype, device=rows.device)
++        per_token = per_token.masked_scatter(mask, rows)
++        weights = model_inputs.get("rollout_is_weights", None)
++        if weights is not None:
++            per_token = per_token * weights
++        loss = agg_loss(loss_mat=per_token, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
++        with torch.no_grad():
++            valid = response_mask.sum().clamp(min=1)
++            metrics = {
++                "distill/kl_token_mean": (rows.sum() / valid).item(),
++                "distill/student_teacher_logp_gap": (
++                    ((student["log_probs"] - teacher_log_prob) * response_mask).sum() / valid
++                ).item(),
++            }
++            if clip_stats is not None:
++                metrics["reverse_kl_clip/reverse_kl_token_mean"] = (clip_stats["reverse_kl"].sum() / valid).item()
++                metrics["reverse_kl_clip/positive_mass_sum"] = clip_stats["positive_mass"].sum().item()
++                metrics["reverse_kl_clip/clipped_positive_mass_sum"] = clip_stats["clipped_positive_mass"].sum().item()
++            if divergence_stats is not None:
++                for key in ("jsd", "forward_kl", "reverse_kl"):
++                    if key in divergence_stats:
++                        metrics[f"divergence/{key}_token_mean"] = (divergence_stats[key].sum() / valid).item()
++                for key in ("clipped_positive_mass", "clipped_vocab"):
++                    metrics[f"divergence/{key}_sum"] = divergence_stats[key].sum().item()
++        return loss, metrics
++
++    def _distill_update_policy(self, data: DataProto, temperature, pad_token_id, loss_mode):
++        """Self-distillation: one optimizer step whose loss is an exact token mean over the step.
++
++        The verl scaling ``rows_in_micro / ppo_mini_batch_size`` would weight
++        micro batches by rows; here every micro batch contributes ``sum over its
++        response tokens / response tokens of the whole step``, whatever the
++        micro batching. The token loss is the full-vocabulary divergence toward
++        the current policy on ``teacher_input_ids`` (IS-weighted per token):
++        reverse KL (``distill_reverse_kl``), its high clip (``distill_reverse_kl_clip``)
++        or another divergence (:data:`DIVERGENCE_LOSS_MODES`). Micro batches are
++        packed by the teacher's token count, the longer of the two forwards.
++        """
++        if self.config.ppo_epochs != 1:
++            raise ValueError(f"{loss_mode} takes exactly one pass (ppo_epochs={self.config.ppo_epochs})")
++        if len(data) > self.config.ppo_mini_batch_size:
++            raise ValueError(
++                f"{loss_mode}: {len(data)} rows exceed ppo_mini_batch_size {self.config.ppo_mini_batch_size}; "
++                "the step would take more than one optimizer step"
++            )
++        step_tokens = float(data.batch["response_mask"].sum().item())
++        if step_tokens <= 0:
++            raise ValueError(f"{loss_mode}: the step has no response tokens")
++        clip_tau = float(data.meta_info["distill_clip_tau"]) if loss_mode in CLIPPED_DISTILL_LOSS_MODES else None
++        divergence = DIVERGENCE_LOSS_MODES[loss_mode][0] if loss_mode in DIVERGENCE_LOSS_MODES else None
++        if self.config.use_dynamic_bsz:
++            max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
++            packing = DataProto.from_dict(tensors={
++                "input_ids": data.batch["teacher_input_ids"],
++                "attention_mask": data.batch["teacher_attention_mask"],
++            })
++            _, index_lists = prepare_dynamic_batch(packing, max_token_len=max_token_len)
++            micro_batches = [data.select_idxs(list(indices)) for indices in index_lists]
++        else:
++            micro_batches = data.split(self.config.ppo_micro_batch_size_per_gpu)
++
++        # Per-step memory window: the peak before the reset covers the IS-weight
++        # pass of the step (since vLLM slept).
++        device = get_torch_device()
++        track = hasattr(device, "max_memory_allocated")  # absent on CPU (unit tests)
++        memory = {
++            "update/allocated_at_update_start_gb": device.memory_allocated() / 1024**3,
++            "update/peak_allocated_before_update_gb": device.max_memory_allocated() / 1024**3,
++        } if track else {}
++        if track:
++            device.reset_peak_memory_stats()
++        metrics = {"actor/pg_loss": 0.0}
++        kl_token_mean = 0.0
++        self.actor_optimizer.zero_grad()
++        for micro_batch in micro_batches:
++            micro_batch = micro_batch.to(get_device_id())
++            model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
++            share = model_inputs["response_mask"].sum().item() / step_tokens
++            token_mean, micro_batch_metrics = self._full_vocab_divergence_loss(
++                model_inputs, temperature, "token-mean", clip_tau=clip_tau, divergence=divergence
++            )
++            loss = token_mean * share
++            kl_token_mean += micro_batch_metrics["distill/kl_token_mean"] * share
++            loss.backward()
++            metrics["actor/pg_loss"] += loss.detach().item()
++            append_to_dict(metrics, micro_batch_metrics)
++            del loss
++        grad_norm = self._optimizer_step()
++        self.actor_optimizer.zero_grad()
++        if track:
++            memory["update/allocated_at_update_end_gb"] = device.memory_allocated() / 1024**3
++            memory["update/peak_allocated_update_gb"] = device.max_memory_allocated() / 1024**3
++        append_to_dict(metrics, {
++            "actor/grad_norm": grad_norm.detach().item(),
++            "update/step_response_tokens": step_tokens,
++            "update/micro_batches": float(len(micro_batches)),
++            # _optimizer_step skips optimizer.step() on a non-finite grad norm;
++            # 0 here makes the trainer stop instead of checkpointing the step.
++            "update/optimizer_steps": float(torch.isfinite(torch.as_tensor(grad_norm)).item()),
++            **memory,
++        })
++        metrics["update/kl_token_mean"] = kl_token_mean
++        return metrics
++
++    def _sft_update_policy(self, data: DataProto, pad_token_id):
++        """SFT: one optimizer step on the NLL of the response tokens (temperature 1),
++        each micro batch weighted by its share of the step's response tokens. Micro batches
++        are packed by the student's tokens (``ppo_max_token_len_per_gpu``)."""
++        loss_mode = SFT_LOSS_MODE
++        if self.config.ppo_epochs != 1:
++            raise ValueError(f"{loss_mode} takes exactly one pass (ppo_epochs={self.config.ppo_epochs})")
++        if len(data) > self.config.ppo_mini_batch_size:
++            raise ValueError(
++                f"{loss_mode}: {len(data)} rows exceed ppo_mini_batch_size {self.config.ppo_mini_batch_size}; "
++                "the step would take more than one optimizer step"
++            )
++        step_tokens = float(data.batch["response_mask"].sum().item())
++        if step_tokens <= 0:
++            raise ValueError(f"{loss_mode}: the step has no response tokens")
++        if self.config.use_dynamic_bsz:
++            max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
++            micro_batches, _ = prepare_dynamic_batch(data, max_token_len=max_token_len)
++        else:
++            micro_batches = data.split(self.config.ppo_micro_batch_size_per_gpu)
++        device = get_torch_device()
++        track = hasattr(device, "max_memory_allocated")  # absent on CPU (unit tests)
++        memory = {"update/allocated_at_update_start_gb": device.memory_allocated() / 1024**3} if track else {}
++        if track:
++            device.reset_peak_memory_stats()
++        metrics = {"actor/pg_loss": 0.0}
++        self.actor_optimizer.zero_grad()
++        for micro_batch in micro_batches:
++            micro_batch = micro_batch.to(get_device_id())
++            model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
++            response_mask = model_inputs["response_mask"]
++            outputs = self._forward_micro_batch(model_inputs, temperature=1.0, calculate_entropy=False)
++            loss = -(outputs["log_probs"] * response_mask).sum() / step_tokens
++            loss.backward()
++            metrics["actor/pg_loss"] += loss.detach().item()
++            del loss, outputs
++        grad_norm = self._optimizer_step()
++        self.actor_optimizer.zero_grad()
++        if track:
++            memory["update/allocated_at_update_end_gb"] = device.memory_allocated() / 1024**3
++            memory["update/peak_allocated_update_gb"] = device.max_memory_allocated() / 1024**3
++        append_to_dict(metrics, {
++            "actor/grad_norm": grad_norm.detach().item(),
++            "update/step_response_tokens": step_tokens,
++            "update/micro_batches": float(len(micro_batches)),
++            "update/optimizer_steps": float(torch.isfinite(torch.as_tensor(grad_norm)).item()),
++            **memory,
++        })
++        return metrics
++
+     @GPUMemoryLogger(role="dp actor", logger=logger)
+     def update_policy(self, data: DataProto):
+         # make sure we are in training mode
+@@ -681,8 +997,16 @@ class DataParallelPPOActor(BasePPOActor):
+         pad_token_id = data.meta_info.get("pad_token_id", 0)
+         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+ 
+-        self_distillation_enabled = loss_mode == "sdpo"
++        self_distillation_enabled = loss_mode in {"sdpo", "seed"}
++        seed_enabled = loss_mode == "seed"
++        # Full-vocabulary divergence toward the same policy under a privileged prompt
++        # (teacher_input_ids), an exact token mean over the whole step (_distill_update_policy).
++        full_vocab_kl_enabled = loss_mode in DISTILL_LOSS_MODES
+         self_distillation_cfg = getattr(self.config, "self_distillation", None)
++        if full_vocab_kl_enabled:
++            teacher_keys = {"teacher_input_ids", "teacher_attention_mask", "teacher_position_ids"}
++            missing = teacher_keys - set(data.batch.keys())
++            assert not missing, f"Missing required keys: {missing}"
+         if self_distillation_enabled:
+             self_distillation_required_keys = {
+                 "teacher_input_ids",
+@@ -705,8 +1029,12 @@ class DataParallelPPOActor(BasePPOActor):
+             select_keys.append("prompts")
+         if self.config.use_kl_loss:
+             select_keys.append("ref_log_prob")
++        if "score_kl_coef" in data.batch.keys():
++            select_keys.append("score_kl_coef")
+         if self_distillation_enabled:
+             select_keys.extend(list(self_distillation_required_keys))
++        if full_vocab_kl_enabled:
++            select_keys.extend(["teacher_input_ids", "teacher_attention_mask", "teacher_position_ids"])
+         # Include pre-computed IS weights if present in batch
+         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
+         if "rollout_is_weights" in data.batch.keys():
+@@ -732,6 +1060,11 @@ class DataParallelPPOActor(BasePPOActor):
+ 
+         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
+ 
++        if loss_mode in DISTILL_LOSS_MODES:
++            return self._distill_update_policy(data, temperature, pad_token_id, loss_mode)
++        if loss_mode == SFT_LOSS_MODE:
++            return self._sft_update_policy(data, pad_token_id)
++
+         metrics = {
+             "actor/pg_loss": 0.0,
+             "actor/kl_loss": 0.0,
+@@ -775,8 +1108,16 @@ class DataParallelPPOActor(BasePPOActor):
+                     if teacher_regularization == "trust-region" and self.use_fused_kernels:
+                         raise ValueError("trust-region teacher requires disabling fused kernels to access logits.")
+                     # all return: (bsz, response_length)
+-                    return_all_logps = self_distillation_cfg.full_logit_distillation and not self_distillation_cfg.distillation_topk
+-                    distill_topk = self_distillation_cfg.distillation_topk if self_distillation_cfg.full_logit_distillation else None
++                    return_all_logps = (
++                        not seed_enabled
++                        and self_distillation_cfg.full_logit_distillation
++                        and not self_distillation_cfg.distillation_topk
++                    )
++                    distill_topk = (
++                        self_distillation_cfg.distillation_topk
++                        if not seed_enabled and self_distillation_cfg.full_logit_distillation
++                        else None
++                    )
+                     outputs = self._forward_micro_batch(
+                         model_inputs,
+                         temperature=temperature,
+@@ -830,20 +1171,48 @@ class DataParallelPPOActor(BasePPOActor):
+                         teacher_log_prob = teacher_outputs["log_probs"]
+                         teacher_all_logps = teacher_outputs.get("all_logps") if return_all_logps else None
+                         teacher_topk_logps = teacher_outputs.get("topk_logps") if distill_topk else None
+-                        pg_loss, pg_metrics = compute_self_distillation_loss(
+-                            student_log_probs=log_prob,
+-                            teacher_log_probs=teacher_log_prob,
+-                            response_mask=response_mask,
+-                            self_distillation_config=self_distillation_cfg,
+-                            old_log_probs=old_log_prob,
+-                            student_all_log_probs=student_all_logps,
+-                            teacher_all_log_probs=teacher_all_logps,
+-                            student_topk_log_probs=student_topk_logps,
+-                            teacher_topk_log_probs=teacher_topk_logps,
+-                            self_distillation_mask=self_distillation_mask,
+-                            loss_agg_mode=loss_agg_mode,
+-                            rollout_is_weights=rollout_is_weights,
+-                        )
++                        if seed_enabled:
++                            policy_loss_fn = get_policy_loss_fn("vanilla")
++                            pg_loss, pg_metrics = policy_loss_fn(
++                                old_log_prob=old_log_prob,
++                                log_prob=log_prob,
++                                advantages=advantages,
++                                response_mask=response_mask,
++                                loss_agg_mode=loss_agg_mode,
++                                config=self.config,
++                                rollout_is_weights=rollout_is_weights,
++                            )
++                            seed_cfg = self.config.seed
++                            opd_loss, opd_metrics = compute_opd_loss(
++                                log_prob=log_prob,
++                                teacher_log_prob=teacher_log_prob,
++                                response_mask=response_mask,
++                                opd_step_mask=self_distillation_mask,
++                                gate_beta=float(seed_cfg["gate_scale"]),
++                                loss_agg_mode=loss_agg_mode,
++                            )
++                            opd_coefficient = float(seed_cfg["opd_coefficient"])
++                            pg_loss = pg_loss + opd_coefficient * opd_loss
++                            pg_metrics.update({
++                                key: value.item() for key, value in opd_metrics.items()
++                            })
++                            pg_metrics["seed/opd_loss"] = opd_loss.detach().item()
++                            pg_metrics["seed/opd_coefficient"] = opd_coefficient
++                        else:
++                            pg_loss, pg_metrics = compute_self_distillation_loss(
++                                student_log_probs=log_prob,
++                                teacher_log_probs=teacher_log_prob,
++                                response_mask=response_mask,
++                                self_distillation_config=self_distillation_cfg,
++                                old_log_probs=old_log_prob,
++                                student_all_log_probs=student_all_logps,
++                                teacher_all_log_probs=teacher_all_logps,
++                                student_topk_log_probs=student_topk_logps,
++                                teacher_topk_log_probs=teacher_topk_logps,
++                                self_distillation_mask=self_distillation_mask,
++                                loss_agg_mode=loss_agg_mode,
++                                rollout_is_weights=rollout_is_weights,
++                            )
+ 
+                         pg_metrics["self_distillation/empty_target_batch"] = self_distillation_mask.sum().item() == 0
+                         micro_batch_metrics.update(pg_metrics)
+@@ -891,11 +1260,19 @@ class DataParallelPPOActor(BasePPOActor):
+                         kld = kl_penalty(
+                             logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
+                         )
++                        score_kl_coef = model_inputs.get("score_kl_coef")
++                        if score_kl_coef is not None:
++                            kld = kld * score_kl_coef
+                         kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+ 
+                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                         metrics["actor/kl_loss"] += kl_loss.detach().item() * loss_scale_factor
+-                        micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
++                        micro_batch_metrics["actor/kl_coef"] = (
++                            score_kl_coef.sum().detach().item()
++                            / response_mask.sum().clamp_min(1).detach().item()
++                            if score_kl_coef is not None
++                            else self.config.kl_loss_coef
++                        )
+ 
+                     if self.config.use_dynamic_bsz:
+                         # relative to the dynamic bsz
+diff --git a/verl/workers/config/actor.py b/verl/workers/config/actor.py
+index f2779d7..105b549 100644
+--- a/verl/workers/config/actor.py
++++ b/verl/workers/config/actor.py
+@@ -47,6 +47,7 @@ class SelfDistillationConfig(BaseConfig):
+         teacher_regularization (str): Teacher regularization mode. Options: "ema", "trust-region".
+         teacher_update_rate (float): EMA update rate for teacher weights, or trust-region mixing coefficient.
+         distillation_topk (Optional[int]): If set, use top-k logits for distillation.
++        vocab_chunk_size (int): Token chunk size for vocabulary-wide top-k and normalization.
+         distillation_add_tail (bool): Whether to add a tail bucket for top-k distillation.
+         max_reprompt_len (int): Maximum length of the reprompted prompt.
+         reprompt_truncation (str): Truncation method for the reprompted prompt (recommended to use "right" or "error").
+@@ -68,6 +69,7 @@ class SelfDistillationConfig(BaseConfig):
+     teacher_regularization: str = "ema"
+     teacher_update_rate: float = 0.05
+     distillation_topk: Optional[int] = None
++    vocab_chunk_size: int = 2048
+     distillation_add_tail: bool = True
+     max_reprompt_len: int = 10240
+     reprompt_truncation: str = "right"
+@@ -108,6 +110,10 @@ class SelfDistillationConfig(BaseConfig):
+             raise ValueError(
+                 f"self_distillation.distillation_topk must be a positive integer, got {self.distillation_topk}"
+             )
++        if self.vocab_chunk_size <= 0:
++            raise ValueError(
++                f"self_distillation.vocab_chunk_size must be positive, got {self.vocab_chunk_size}"
++            )
+         if self.is_clip is not None and self.is_clip <= 0:
+             raise ValueError(f"self_distillation.is_clip must be positive, got {self.is_clip}")
+ 
+@@ -249,6 +255,8 @@ class ActorConfig(BaseConfig):
+     model_config: HFModelConfig = field(default_factory=BaseConfig)
+     router_replay: RouterReplayConfig = field(default_factory=RouterReplayConfig)
+     self_distillation: SelfDistillationConfig = field(default_factory=SelfDistillationConfig)
++    score: dict[str, Any] = field(default_factory=dict)
++    seed: dict[str, Any] = field(default_factory=dict)
+ 
+     # Store global batch info for loss aggregation:
+     # dp_size: data parallel size
+diff --git a/verl/workers/config/model.py b/verl/workers/config/model.py
+index 9fb5ec9..a66d050 100644
+--- a/verl/workers/config/model.py
++++ b/verl/workers/config/model.py
+@@ -78,6 +78,7 @@ class HFModelConfig(BaseConfig):
+     # fsdp lora related. We may setup a separate config later
+     lora_rank: int = 0
+     lora_alpha: int = 16
++    lora_dropout: float = 0.0
+     target_modules: Optional[str] = "all-linear"
+ 
+     exclude_modules: Optional[str] = None
+diff --git a/verl/workers/config/rollout.py b/verl/workers/config/rollout.py
+index 7eb4a18..14e426b 100644
+--- a/verl/workers/config/rollout.py
++++ b/verl/workers/config/rollout.py
+@@ -166,7 +166,7 @@ class RolloutConfig(BaseConfig):
+     log_prob_use_dynamic_bsz: bool = False
+     log_prob_max_token_len_per_gpu: int = 16384
+ 
+-    disable_log_stats: bool = True
++    disable_log_stats: bool = False
+ 
+     multi_stage_wake_up: bool = False
+     engine_kwargs: dict = field(default_factory=dict)
+diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
+index b2e50c7..b33fe87 100644
+--- a/verl/workers/engine/fsdp/transformer_impl.py
++++ b/verl/workers/engine/fsdp/transformer_impl.py
+@@ -58,6 +58,7 @@ from verl.utils.fsdp_utils import (
+     replace_lora_wrapper,
+ )
+ from verl.utils.model import convert_weight_keys, extract_multi_modal_inputs
++from verl.utils.peft_compat import ensure_peft_transformers_compatibility
+ from verl.utils.py_functional import convert_to_regular_types
+ from verl.utils.torch_functional import logprobs_from_logits
+ from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
+@@ -252,6 +253,7 @@ class FSDPEngine(BaseEngine):
+ 
+         lora_adapter_path = getattr(self.model_config, "lora_adapter_path", None)
+         if lora_adapter_path is not None:
++            ensure_peft_transformers_compatibility()
+             from peft import PeftModel
+ 
+             from verl.utils.fs import copy_to_local
+@@ -271,6 +273,7 @@ class FSDPEngine(BaseEngine):
+                 "task_type": TaskType.CAUSAL_LM,
+                 "r": self.model_config.lora_rank,
+                 "lora_alpha": self.model_config.lora_alpha,
++                "lora_dropout": self.model_config.lora_dropout,
+                 "target_modules": convert_to_regular_types(self.model_config.target_modules),
+                 "exclude_modules": convert_to_regular_types(self.model_config.exclude_modules),
+                 "bias": "none",
+diff --git a/verl/workers/fsdp_workers.py b/verl/workers/fsdp_workers.py
+index 17e69ce..26b5aa1 100644
+--- a/verl/workers/fsdp_workers.py
++++ b/verl/workers/fsdp_workers.py
+@@ -16,6 +16,7 @@ The main entry point to run the PPO algorithm
+ """
+ 
+ import datetime
++import glob
+ import json
+ import logging
+ import os
+@@ -81,6 +82,7 @@ from verl.utils.fsdp_utils import (
+ from verl.utils.import_utils import import_external_libs
+ from verl.utils.memory_utils import aggressive_empty_cache
+ from verl.utils.model import compute_position_id_with_mask, convert_weight_keys
++from verl.utils.peft_compat import ensure_peft_transformers_compatibility
+ from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage, simple_timer
+ from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
+ from verl.utils.py_functional import convert_to_regular_types
+@@ -439,6 +441,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+ 
+             lora_adapter_path = self.config.model.get("lora_adapter_path")
+             if lora_adapter_path is not None:
++                ensure_peft_transformers_compatibility()
+                 from peft import PeftModel
+ 
+                 print(f"Loading pre-trained LoRA adapter to {role} from: {lora_adapter_path}")
+@@ -458,6 +461,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+                     "task_type": TaskType.CAUSAL_LM,
+                     "r": self.config.model.lora_rank,
+                     "lora_alpha": self.config.model.lora_alpha,
++                    "lora_dropout": self.config.model.get("lora_dropout", 0.0),
+                     "target_modules": convert_to_regular_types(self.config.model.target_modules),
+                     "exclude_modules": convert_to_regular_types(self.config.model.exclude_modules),
+                     "bias": "none",
+@@ -515,9 +519,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+         sharding_strategy = get_sharding_strategy(fsdp_mesh, fsdp_enable_zero3)
+ 
+         # TODO: add transformer policy
+-        # We force reference policy to use CPUOffload to save memory.
+-        # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
+-        cpu_offload = None if role == "actor" else CPUOffload(offload_params=True)
++        # Actor offload is managed by the hybrid-engine helpers below.  The
++        # reference/teacher must honor its explicit FSDP setting as well: a
++        # forced CPU copy of an 8B EMA teacher can exceed a 60 GiB host-memory
++        # allocation even when the LoRA optimizer state is small.
++        cpu_offload = None
++        if role == "ref" and fsdp_config.get("param_offload", False):
++            cpu_offload = CPUOffload(offload_params=True)
+         fsdp_strategy = self.config.actor.strategy
+         if fsdp_strategy == "fsdp":
+             actor_module_fsdp = FSDP(
+@@ -688,12 +696,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+         peft_model = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+         if hasattr(peft_model, "peft_config"):  # LoRA
+             peft_config = peft_model.peft_config.get("default", None)
++            sleep_level_two = getattr(self.rollout, "sleep_level", None) == 2
+             params = collect_lora_params(
+                 module=self.actor_module_fsdp,
+                 layered_summon=self.config.rollout.get("layered_summon", False),
+-                base_sync_done=self.base_sync_done,
++                # Level-2 sleep destroys the vLLM base weights.  Collect the
++                # adapter here and collect the base exactly once below.
++                base_sync_done=self.base_sync_done or sleep_level_two,
+             )
+-            if not self.base_sync_done:
++            if not self.base_sync_done and not sleep_level_two:
+                 params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
+         else:
+             params = self.actor_module_fsdp.state_dict()
+@@ -706,7 +717,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+         # When sleep_level=2, base model weights are destroyed during each sleep cycle.
+         # separately collect and update LoRA weights and base model weights through their respective interfaces.
+         # Here: params contains LoRA weights, base_model_params contains base model weights.
+-        if peft_config is not None and getattr(self.rollout, "sleep_level", None) == 2:
++        if peft_config is not None and sleep_level_two:
+             base_model_params = collect_lora_params(
+                 module=self.actor_module_fsdp,
+                 layered_summon=self.layered_summon,
+@@ -737,7 +748,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+             await self.rollout.resume(tags=["weights"])
+         log_gpu_memory_usage("After resume weights", logger=logger)
+ 
+-        if peft_config is not None and getattr(self.rollout, "sleep_level", None) == 2:
++        if peft_config is not None and sleep_level_two:
+             per_tensor_base_params = (
+                 (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
+                 for name, param in base_model_params.items()
+@@ -745,7 +756,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+             await self.rollout.update_weights(per_tensor_base_params, base_sync_done=False)
+             del base_model_params, per_tensor_base_params
+ 
+-        await self.rollout.update_weights(per_tensor_param, peft_config=peft_config, base_sync_done=self.base_sync_done)
++        await self.rollout.update_weights(
++            per_tensor_param,
++            peft_config=peft_config,
++            base_sync_done=self.base_sync_done or (peft_config is not None and sleep_level_two),
++        )
+         log_gpu_memory_usage("After update_weights", logger=logger)
+         del params, per_tensor_param
+         aggressive_empty_cache(force_sync=True)
+@@ -760,10 +775,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+ 
+     async def trainer_mode(self):
+         """Context switch hybridengine to trainer mode."""
++        device = get_torch_device()
++        self._rollout_live_before_release_gb = device.memory_allocated() / (1024**3)
+         if self.config.rollout.free_cache_engine:
+             log_gpu_memory_usage("Before rollout offload", logger=logger)
+             await self.rollout.release()
+             log_gpu_memory_usage("After rollout offload", logger=logger)
++        self._rollout_live_after_release_gb = device.memory_allocated() / (1024**3)
++        self._rollout_peak_allocated_gb = device.max_memory_allocated() / (1024**3)
++        self._rollout_peak_reserved_gb = device.max_memory_reserved() / (1024**3)
++        # Start an independent peak window for old/ref log-prob and the policy
++        # update. Resetting allocator statistics does not free or mutate tensors.
++        device.reset_peak_memory_stats()
+ 
+         self.actor_module_fsdp.train()
+ 
+@@ -893,7 +916,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+             if self._is_actor:
+                 self_distillation_cfg = self.config.actor.get("self_distillation", None)
+                 loss_mode = self.config.actor.policy_loss.get("loss_mode", "vanilla")
+-                if self_distillation_cfg is not None and loss_mode == "sdpo":
++                if self_distillation_cfg is not None and loss_mode in {"sdpo", "seed"}:
+                     teacher_regularization = self_distillation_cfg.get("teacher_regularization", "ema")
+                     if teacher_regularization == "trust-region":
+                         self.actor.teacher_module = TrustRegionTeacher(
+@@ -903,6 +926,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+                         )
+                     else:
+                         self.actor.teacher_module = self.ref_module_fsdp
++                    self.actor.initialize_teacher()
+ 
+         if self._is_actor:
+             self.flops_counter = FlopsCounter(self.actor_model_config)
+@@ -931,6 +955,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+     @DistProfiler.annotate(color="red", role="actor_update")
+     def update_actor(self, data: DataProto):
+         assert self._is_actor
++        device = get_torch_device()
++        update_live_start_gb = device.memory_allocated() / (1024**3)
+         if self._is_offload_param:
+             load_fsdp_model_to_gpu(self.actor_module_fsdp)
+         if self._is_offload_optimizer:
+@@ -951,8 +977,32 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+             metrics["perf/mfu/actor"] = (
+                 estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
+             )
+-            metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
+-            metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
++            policy_peak_allocated_gb = device.max_memory_allocated() / (1024**3)
++            policy_peak_reserved_gb = device.max_memory_reserved() / (1024**3)
++            rollout_peak_allocated_gb = getattr(
++                self, "_rollout_peak_allocated_gb", 0.0
++            )
++            metrics["perf/rollout_live_before_release_gb"] = getattr(
++                self, "_rollout_live_before_release_gb", 0.0
++            )
++            metrics["perf/rollout_live_after_release_gb"] = getattr(
++                self, "_rollout_live_after_release_gb", 0.0
++            )
++            metrics["perf/rollout_peak_allocated_gb"] = rollout_peak_allocated_gb
++            metrics["perf/rollout_peak_reserved_gb"] = getattr(
++                self, "_rollout_peak_reserved_gb", 0.0
++            )
++            metrics["perf/policy_live_at_update_start_gb"] = update_live_start_gb
++            metrics["perf/policy_live_at_update_end_gb"] = device.memory_allocated() / (1024**3)
++            metrics["perf/policy_peak_allocated_gb"] = policy_peak_allocated_gb
++            metrics["perf/policy_peak_reserved_gb"] = policy_peak_reserved_gb
++            metrics["perf/max_memory_allocated_gb"] = max(
++                rollout_peak_allocated_gb, policy_peak_allocated_gb
++            )
++            metrics["perf/max_memory_reserved_gb"] = max(
++                getattr(self, "_rollout_peak_reserved_gb", 0.0),
++                policy_peak_reserved_gb,
++            )
+             metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+ 
+             lr = self.actor_lr_scheduler.get_last_lr()[0]
+@@ -1045,7 +1095,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+         data.meta_info["temperature"] = self.config.rollout.temperature
+         data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
+         # perform recompute log_prob
+-        calculate_entropy = not is_lora
++        # A caller that reads only log-probs sets skip_entropy to avoid a
++        # full-vocabulary entropy over every token.
++        calculate_entropy = not is_lora and not data.meta_info.pop("skip_entropy", False)
+         with self.ulysses_sharding_manager:
+             with adapter_ctx:
+                 outputs = self.actor.compute_log_prob(data=data, calculate_entropy=calculate_entropy)
+@@ -1119,8 +1171,24 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+         if self._is_offload_param:
+             load_fsdp_model_to_gpu(self.actor_module_fsdp)
+ 
++        # A LoRA checkpoint is only resumable with its optimizer (and extra
++        # state) beside the adapter, so both are written at every save; the
++        # trainer prunes older global_step_* directories once the new one and
++        # the tracker are on disk (verl.utils.checkpoint.lora_resume).
++        optimizer_save_freq = int(self.config.actor.checkpoint.get("optimizer_save_freq", 1))
++        if self._is_lora:
++            if optimizer_save_freq != 1:
++                raise ValueError(
++                    f"optimizer_save_freq={optimizer_save_freq}: LoRA checkpoints must save the optimizer every time"
++                )
++            missing = {"optimizer", "extra"} - set(self.checkpoint_manager.checkpoint_save_contents)
++            if missing:
++                raise ValueError(f"LoRA checkpoint save_contents lacks {sorted(missing)}")
+         self.checkpoint_manager.save_checkpoint(
+-            local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
++            local_path=local_path,
++            hdfs_path=hdfs_path,
++            global_step=global_step,
++            max_ckpt_to_keep=max_ckpt_to_keep,
+         )
+         dist.barrier()
+ 
+@@ -1155,6 +1223,24 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+                 log_only_rank_0=True,
+             )
+ 
++            teacher_module = getattr(self.actor, "teacher_module", None)
++            if teacher_module is not None and teacher_module is not self.actor_module_fsdp:
++                teacher_save_path = os.path.join(local_path, "ema_lora_adapter")
++                teacher_peft_model = getattr(teacher_module, "_fsdp_wrapped_module", teacher_module)
++                teacher_config = asdict(teacher_peft_model.peft_config.get("default", {}))
++                teacher_config["task_type"] = teacher_config["task_type"].value
++                teacher_config["peft_type"] = teacher_config["peft_type"].value
++                teacher_config["target_modules"] = list(teacher_config["target_modules"])
++                teacher_params = layered_summon_lora_params(teacher_module)
++                if dist.get_rank() == 0:
++                    os.makedirs(teacher_save_path, exist_ok=True)
++                    save_file(teacher_params, os.path.join(teacher_save_path, "adapter_model.safetensors"))
++                    with open(
++                        os.path.join(teacher_save_path, "adapter_config.json"), "w", encoding="utf-8"
++                    ) as handle:
++                        json.dump(teacher_config, handle, ensure_ascii=False, indent=4)
++                dist.barrier()
++
+         if self._is_offload_param:
+             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+ 
+@@ -1176,10 +1262,32 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+         if self._is_offload_param:
+             load_fsdp_model_to_gpu(self.actor_module_fsdp)
+ 
++        from verl.utils.checkpoint import lora_resume
++
++        resume_lora = self._is_actor and self._is_lora
++        # Hard checks: a LoRA resume must restore adapter, optimizer and extra.
++        lora_resume.assert_resume_contents(self.checkpoint_manager, local_path, resume_lora)
++
+         self.checkpoint_manager.load_checkpoint(
+             local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
+         )
+ 
++        if resume_lora:
++            # The sharded model state is not part of a LoRA checkpoint; the
++            # adapter written beside it is loaded into the FSDP module here
++            # (overriding any model.lora_adapter_path used to build it, e.g.
++            # SEED-RL's SFT adapter) and checked tensor by tensor.
++            lora_resume.restore_adapter(self.actor_module_fsdp, local_path, lora_resume.ADAPTER_DIR, "actor")
++            teacher = getattr(self.actor, "teacher_module", None)
++            if teacher is not None and teacher is getattr(self, "ref_module_fsdp", None):
++                if not os.path.exists(lora_resume.adapter_file(local_path, lora_resume.EMA_ADAPTER_DIR)):
++                    raise lora_resume.ResumeError(
++                        f"LoRA resume: the run has an EMA teacher but {local_path} has no "
++                        f"{lora_resume.EMA_ADAPTER_DIR}"
++                    )
++                lora_resume.restore_adapter(teacher, local_path, lora_resume.EMA_ADAPTER_DIR, "ema_teacher")
++            dist.barrier()
++
+         if self._is_offload_param:
+             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+ 
+@@ -1397,6 +1505,7 @@ class CriticWorker(Worker, DistProfilerExtension):
+             # Check if we should load a pre-trained LoRA adapter
+             lora_adapter_path = self.config.model.get("lora_adapter_path")
+             if lora_adapter_path is not None:
++                ensure_peft_transformers_compatibility()
+                 from peft import PeftModel
+ 
+                 print(f"Loading pre-trained LoRA adapter to critic from: {lora_adapter_path}")
+diff --git a/verl/workers/reward_manager/naive.py b/verl/workers/reward_manager/naive.py
+index c9223f1..69a813b 100644
+--- a/verl/workers/reward_manager/naive.py
++++ b/verl/workers/reward_manager/naive.py
+@@ -13,6 +13,9 @@
+ # limitations under the License.
+ 
+ from collections import defaultdict
++from concurrent.futures import ThreadPoolExecutor
++import os
++import time
+ from typing import Any
+ 
+ import torch
+@@ -54,8 +57,7 @@ class NaiveRewardManager(AbstractRewardManager):
+         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
+         reward_extra_info = defaultdict(list)
+ 
+-        already_print_data_sources = {}
+-
++        prepared = []
+         for i in range(len(data)):
+             data_item = data[i]  # DataProtoItem
+ 
+@@ -76,25 +78,80 @@ class NaiveRewardManager(AbstractRewardManager):
+ 
+             ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
+             data_source = data_item.non_tensor_batch[self.reward_fn_key]
+-            extra_info = data_item.non_tensor_batch.get("extra_info", {})
++            extra_info = dict(data_item.non_tensor_batch.get("extra_info", {}))
++            # Multi-turn algorithms may need exact per-turn text/boundaries in
++            # their custom reward without exposing those fields to the prompt.
++            for key in (
++                "score_first_response",
++                "score_second_response",
++                "score_turn1_tokens",
++                "score_bridge_tokens",
++                "score_turn2_tokens",
++                "score_first_stop_reason",
++                "score_second_stop_reason",
++                # LLM-judge verdicts from the trainer's rewarding phase.
++                "judge_verdict",
++                "score_first_judge",
++                "score_second_judge",
++            ):
++                if key in data_item.non_tensor_batch:
++                    extra_info[key] = data_item.non_tensor_batch[key]
+             num_turns = data_item.non_tensor_batch.get("__num_turns__", None)
+             rollout_reward_scores = data_item.non_tensor_batch.get("reward_scores", {})
+             extra_info["num_turns"] = num_turns
+             extra_info["rollout_reward_scores"] = rollout_reward_scores
+             extra_info["truncated"] = not (valid_response_ids == self.tokenizer.eos_token_id).any().item()
+ 
++            prepared.append(
++                {
++                    "index": i,
++                    "prompt": prompt_str,
++                    "response": response_str,
++                    "valid_response_length": valid_response_length,
++                    "data_source": data_source,
++                    "ground_truth": ground_truth,
++                    "extra_info": extra_info,
++                }
++            )
++
++        def evaluate(item):
++            started = time.monotonic()
+             score = self.compute_score(
+-                data_source=data_source,
+-                solution_str=response_str,
+-                ground_truth=ground_truth,
+-                extra_info=extra_info,
++                data_source=item["data_source"],
++                solution_str=item["response"],
++                ground_truth=item["ground_truth"],
++                extra_info=item["extra_info"],
+             )
++            return score, time.monotonic() - started
++
++        candidate_workers = min(
++            len(prepared),
++            max(1, int(os.environ.get("LEAF_VERIFIER_CANDIDATE_WORKERS", "1"))),
++        )
++        if candidate_workers > 1:
++            # Each candidate keeps its existing isolated per-test subprocesses.
++            # Threads only overlap independent candidate supervisors, avoiding
++            # another long-lived process layer around a GPU-owning Ray worker.
++            with ThreadPoolExecutor(
++                max_workers=candidate_workers,
++                thread_name_prefix="lcb-verifier",
++            ) as executor:
++                scored = list(executor.map(evaluate, prepared))
++        else:
++            scored = [evaluate(item) for item in prepared]
++
++        already_print_data_sources = {}
++        for item, (score, verifier_seconds) in zip(prepared, scored, strict=True):
++            i = item["index"]
++            data_source = item["data_source"]
++            valid_response_length = item["valid_response_length"]
+ 
+             if isinstance(score, dict):
+                 reward = score["score"]
+                 # Store the information including original reward
+                 for key, value in score.items():
+                     reward_extra_info[key].append(value)
++                reward_extra_info["verifier_candidate_seconds"].append(verifier_seconds)
+             else:
+                 reward = score
+ 
+@@ -105,9 +162,9 @@ class NaiveRewardManager(AbstractRewardManager):
+ 
+             if already_print_data_sources[data_source] < self.num_examine:
+                 already_print_data_sources[data_source] += 1
+-                print("[prompt]", prompt_str)
+-                print("[response]", response_str)
+-                print("[ground_truth]", ground_truth)
++                print("[prompt]", item["prompt"])
++                print("[response]", item["response"])
++                print("[ground_truth]", item["ground_truth"])
+                 if isinstance(score, dict):
+                     for key, value in score.items():
+                         print(f"[{key}]", value)
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index 71178f9..26916b8 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -465,8 +465,14 @@ class vLLMHttpServer:
+         image_data: Optional[list[Any]] = None,
+         video_data: Optional[list[Any]] = None,
+         priority: int = 0,
++        use_lora: bool = True,
+     ) -> TokenOutput:
+-        """Generate sequence with token-in-token-out."""
++        """Generate sequence with token-in-token-out.
++
++        ``use_lora=False`` generates on the base weights even while the
++        policy's adapter is loaded (the LLM judge is the frozen base model,
++        served by the same engine).
++        """
+         # Calculate the maximum possible new tokens based on available context space
+         # This serves as a safety upper bound
+         max_possible_tokens = self.config.max_model_len - len(prompt_ids)
+@@ -506,7 +512,7 @@ class vLLMHttpServer:
+ 
+         # Add lora request
+         lora_request = None
+-        if self.model_config.lora_rank > 0:
++        if use_lora and self.model_config.lora_rank > 0:
+             # Make sure we also check that the lora is already loaded in the engine
+             lora_loaded = VLLM_LORA_INT_ID in await self.engine.list_loras()
+             if lora_loaded:
